@@ -3,13 +3,14 @@ from __future__ import annotations
 import argparse
 import sys
 
-from PySide6.QtCore import QLockFile
+from PySide6.QtCore import QLockFile, QTimer
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from .storage import Store
 from .locations import configuration_directory
 from .ui import MainWindow
 from .display import prepare_display, application_font
+from . import __version__
 
 
 def main():
@@ -20,6 +21,7 @@ def main():
     prepare_display()
     app = QApplication(sys.argv[:1])
     app.setApplicationName("AutoDL Fresh")
+    app.setApplicationVersion(__version__)
     app.setOrganizationName("AutoDLFresh")
     app.setStyle("Fusion")
     app.setFont(application_font())
@@ -44,4 +46,5 @@ def main():
     app.aboutToQuit.connect(lock.unlock)
     if not args.minimized or not window.tray.isVisible():
         window.show()
+    QTimer.singleShot(2500, window.check_updates_automatically)
     sys.exit(app.exec())

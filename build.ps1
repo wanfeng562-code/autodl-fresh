@@ -1,5 +1,8 @@
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
+$taskOutputExe = Join-Path $PSScriptRoot 'dist\AutoDLFresh\AutoDLFresh.exe'
+$taskRunning = Get-Process AutoDLFresh -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $taskOutputExe }
+if ($taskRunning) { throw 'Please safely exit AutoDL Fresh before rebuilding its program folder.' }
 $taskPython = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $taskPython)) {
     throw 'Please run setup.bat first.'

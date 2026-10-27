@@ -25,6 +25,7 @@ class Settings:
     headless: bool = True
     browser_visibility: str = "background"
     page_size: int = 10
+    auto_check_updates: bool = True
     timeout_seconds: int = 240
     poll_seconds: int = 5
     minimize_to_tray: bool = True
@@ -45,6 +46,8 @@ class Settings:
             raise ValueError("不支持的浏览器显示方式")
         if self.page_size not in {10, 20, 50, 100}:
             raise ValueError("每页条数需为 10、20、50 或 100")
+        if not isinstance(self.auto_check_updates, bool):
+            raise ValueError("自动检查更新选项必须为开启或关闭")
         if not 30 <= self.timeout_seconds <= 900 or not 1 <= self.poll_seconds <= 30:
             raise ValueError("状态等待时间需为 30–900 秒，轮询间隔需为 1–30 秒")
         parsed = urlsplit(self.console_url)

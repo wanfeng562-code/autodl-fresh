@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autodl-fresh"
-version = "0.5.0"
+version = "0.6.0"
 description = "AutoDL 容器实例保活桌面助手"
 authors = [{name = "wanfeng562-code"}]
 license = "LicenseRef-AutoDLFresh-NonCommercial-1.0"

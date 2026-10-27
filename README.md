@@ -2,10 +2,10 @@
 
 AutoDL 普通容器实例的中文桌面保活助手，使用 Python、Playwright 和 PySide6 构建。
 
-**当前正式版：0.5.0** · Windows 10 / 11 x64 · **仅限非商业使用**
+**当前正式版：0.6.0** · Windows 10 / 11 x64 · **仅限非商业使用**
 
-[下载 Windows 正式版](https://github.com/wanfeng562-code/autodl-fresh/releases/download/v0.5.0/AutoDLFresh-0.5.0-windows-x64.zip)
-| [发布说明](https://github.com/wanfeng562-code/autodl-fresh/releases/tag/v0.5.0)
+[下载 Windows 正式版](https://github.com/wanfeng562-code/autodl-fresh/releases/download/v0.6.0/AutoDLFresh-0.6.0-windows-x64.zip)
+| [发布说明](https://github.com/wanfeng562-code/autodl-fresh/releases/tag/v0.6.0)
 | [许可协议](LICENSE)
 | [更新日志](CHANGELOG.md)
 
@@ -21,6 +21,7 @@ AutoDL 普通容器实例的中文桌面保活助手，使用 Python、Playwrigh
 - 前台 / 后台模式、实例自动滚动定位、登录保存提示和空白窗口清理。
 - 可查看和更换数据目录；设置中的下拉框和数值控件需先点击才能用滚轮修改。
 - 逐显示器 DPI 支持，适配 Windows 系统缩放。
+- 软件内检查 GitHub 最新正式版本，新版本提示、后台下载、取消和 SHA-256 校验。
 
 ![AutoDL Fresh 实例总览（模拟数据）](docs/overview.png)
 
@@ -42,6 +43,21 @@ AutoDL 普通容器实例的中文桌面保活助手，使用 Python、Playwrigh
 
 升级前先从托盘退出旧程序，再启动新版。已有登录态和设置继续使用；
 如启用了 Windows 自启动，在新版点一次「保存设置」更新启动路径。
+
+## 检查和下载更新
+
+侧栏、托盘菜单或「偏好设置 → 软件更新」都可进入检查更新。
+默认启动后在后台检查一次，可取消勾选「启动时自动检查更新」并保存。
+只检查项目的公开正式 Release，不需要 GitHub 登录，不读取或上传 AutoDL 登录态。
+没有新版本或自动检查遇到网络问题时不会弹窗打扰；发现新版时显示提示条和托盘通知。
+
+点击「下载更新」选择 ZIP 保存位置。下载显示进度，支持取消，并在完成前核对
+文件大小、SHA-256 和程序包结构。失败或取消会清理本次临时文件，原有文件保留。
+可点击「打开下载目录」查看更新包。
+
+本版支持下载更新包，不会在实例操作期间替换运行中的程序。
+请先安全退出软件，再将整个文件夹解压到程序目录；数据目录中的登录态和设置保留。
+0.5.0 没有内置更新入口，首次升级到 0.6.0 请使用上方下载链接。
 
 ## 执行与异常恢复
 
@@ -106,6 +122,8 @@ python -m venv .venv
 不访问真实 AutoDL 实例，也不产生云费用。普通窗口测试需要允许 Edge 渲染进程的桌面环境。
 
 正式版对应的 Qt / PySide6 源码和许可收集：
+
+构建前先安全退出输出目录中运行的程序；也可用 PyInstaller 的其他输出目录单独打包。
 
 ```powershell
 .\.venv\Scripts\python.exe tools/collect_third_party.py

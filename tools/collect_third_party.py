@@ -1,4 +1,4 @@
-"""Collect exact upstream sources and notices for the 0.5.0 Windows release."""
+"""Collect exact upstream sources and notices for the current Windows release."""
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
@@ -9,12 +9,14 @@ from pathlib import Path
 import shutil
 import ssl
 import tarfile
+import tomllib
 import urllib.request
 import zipfile
 
 import certifi
 
 ROOT = Path(__file__).resolve().parent.parent
+VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
 QT = "6.10.2"
 SOURCES = {
     "pyside-setup-everywhere-src-6.10.2.tar.xz":
@@ -39,7 +41,7 @@ def main():
         target = cache / name
         if not target.exists():
             temp = target.with_suffix(target.suffix + ".part")
-            request = urllib.request.Request(url, headers={"User-Agent": "AutoDLFresh-Release/0.5.0"})
+            request = urllib.request.Request(url, headers={"User-Agent": f"AutoDLFresh-Release/{VERSION}"})
             context = ssl.create_default_context(cafile=certifi.where())
             with urllib.request.urlopen(request, timeout=60, context=context) as response, temp.open("wb") as file:
                 shutil.copyfileobj(response, file)
@@ -89,7 +91,7 @@ def main():
     (licenses / "sources.json").write_text(json.dumps(sources, indent=2) + "\n", encoding="utf-8")
     releases = ROOT / "releases"
     releases.mkdir(exist_ok=True)
-    artifact = releases / "AutoDLFresh-0.5.0-third-party-sources.zip"
+    artifact = releases / f"AutoDLFresh-{VERSION}-third-party-sources.zip"
     with zipfile.ZipFile(artifact, "w", compression=zipfile.ZIP_STORED) as bundle:
         for name in SOURCES:
             bundle.write(cache / name, name)

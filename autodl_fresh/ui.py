@@ -6,8 +6,8 @@ import os
 from pathlib import Path
 import sys
 
-from PySide6.QtCore import Qt, QTime, QTimer, QPointF
-from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
+from PySide6.QtCore import Qt, QTime, QTimer, QPointF, QStandardPaths, QUrl
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QListWidget, QMainWindow, QMenu, QMessageBox,
@@ -21,6 +21,8 @@ from .locations import migrate_data
 from .widgets import protect_settings_scroll
 from .storage import Store
 from .worker import BrowserWorker
+from .updater import RELEASES_URL, UpdateWorker
+from . import __version__
 
 
 STYLE = """
@@ -153,6 +155,10 @@ class MainWindow(QMainWindow):
         self._directory_switch_pending = False
         legacy_repaired = store.clear_legacy_preflight()
         self.worker: BrowserWorker | None = None
+        self.update_worker: UpdateWorker | None = None
+        self.latest_release = None
+        self.downloaded_update = None
+        self._notified_update_tag = ""
         self.report: RunReport | None = None
         self.auth_valid = store.auth_path.exists()
         self._quitting = False
@@ -197,11 +203,13 @@ class MainWindow(QMainWindow):
         self.nav.setCurrentRow(0)
         self.nav.currentRowChanged.connect(lambda index: self.stack.setCurrentIndex(index))
         side.addWidget(self.nav)
+        self.sidebar_update_button = button("检查更新", self._open_update_checker)
+        side.addWidget(self.sidebar_update_button)
         side.addWidget(label("LOCAL DESKTOP APP", "brandSub"))
         side.addSpacing(10)
         self.side_status = label("○  尚未连接 AutoDL", "sideNote")
         side.addWidget(self.side_status)
-        side.addWidget(label("v0.5.0  /  本机运行", "brandSub"))
+        side.addWidget(label(f"v{__version__}  /  本机运行", "brandSub"))
         side.addWidget(label("© 2026 wanfeng562-code", "brandSub"))
         side.addWidget(label("仅限非商业使用", "brandSub"))
         side.addWidget(label("Qt / PySide6 © The Qt Company Ltd. 及贡献者", "brandSub", True))
@@ -212,6 +220,14 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(content)
         layout.setContentsMargins(30, 28, 30, 18)
         layout.setSpacing(16)
+        self.update_banner = card("hero")
+        banner_row = QHBoxLayout(self.update_banner)
+        self.update_banner_text = label("", "heroTitle", True)
+        banner_row.addWidget(self.update_banner_text, 1)
+        banner_row.addWidget(button("查看更新", self._open_updates))
+        banner_row.addWidget(button("稍后", self.update_banner.hide))
+        self.update_banner.hide()
+        layout.addWidget(self.update_banner)
         self.stack = QStackedWidget()
         self.stack.addWidget(self._overview())
         self.stack.addWidget(self._records())
@@ -464,6 +480,43 @@ class MainWindow(QMainWindow):
         form.addRow(self.startup)
         form.addRow(label("每日计划依赖本机开机且应用运行；电脑睡眠或退出应用期间无法检查。", "muted", True))
         layout.addWidget(desktop)
+        self.update_group = QGroupBox("软件更新")
+        updates = QVBoxLayout(self.update_group)
+        update_actions = QHBoxLayout()
+        update_actions.addWidget(label(f"当前版本：{__version__}"))
+        update_actions.addStretch()
+        self.update_check_button = button("检查更新", lambda: self._check_updates(manual=True))
+        self.update_page_button = button("GitHub 发布页", self._open_release_page)
+        update_actions.addWidget(self.update_check_button)
+        update_actions.addWidget(self.update_page_button)
+        updates.addLayout(update_actions)
+        self.auto_update_check = QCheckBox("启动时自动检查更新")
+        self.auto_update_check.setChecked(self.settings.auto_check_updates)
+        updates.addWidget(self.auto_update_check)
+        self.update_status_label = label("从项目公开的 GitHub Release 检查正式版，不需要登录 GitHub。", "muted", True)
+        updates.addWidget(self.update_status_label)
+        self.update_notes = QPlainTextEdit()
+        self.update_notes.setReadOnly(True)
+        self.update_notes.setMaximumHeight(150)
+        self.update_notes.hide()
+        updates.addWidget(self.update_notes)
+        self.update_progress = QProgressBar()
+        self.update_progress.hide()
+        updates.addWidget(self.update_progress)
+        download_actions = QHBoxLayout()
+        self.update_download_button = button("下载更新", self._download_update, True)
+        self.update_download_button.setEnabled(False)
+        self.update_cancel_button = button("取消下载", self._cancel_update)
+        self.update_cancel_button.hide()
+        self.update_folder_button = button("打开下载目录", self._open_download_folder)
+        self.update_folder_button.hide()
+        download_actions.addWidget(self.update_download_button)
+        download_actions.addWidget(self.update_cancel_button)
+        download_actions.addWidget(self.update_folder_button)
+        download_actions.addStretch()
+        updates.addLayout(download_actions)
+        updates.addWidget(label("更新包在后台下载并校验。下载后请安全退出软件，再将整个文件夹解压到程序目录；登录态和设置保留。", "muted", True))
+        layout.addWidget(self.update_group)
         data = QGroupBox("数据目录")
         data_layout = QVBoxLayout(data)
         self.data_directory_field = QLineEdit(str(self.store.root.resolve()))
@@ -524,7 +577,8 @@ class MainWindow(QMainWindow):
         self.tray = QSystemTrayIcon(app_icon(), self)
         self.tray.setToolTip("AutoDL Fresh · 实例保活助手")
         menu = QMenu(self)
-        for text, handler in [("显示主窗口", self._show), ("只读检查", lambda: self._start("preview")), ("检查并刷新", lambda: self._start("refresh"))]:
+        for text, handler in [("显示主窗口", self._show), ("只读检查", lambda: self._start("preview")),
+                              ("检查并刷新", lambda: self._start("refresh")), ("检查更新", self._open_update_checker)]:
             action = QAction(text, self)
             action.triggered.connect(handler)
             menu.addAction(action)
@@ -542,6 +596,126 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
+    def _open_updates(self):
+        self.nav.setCurrentRow(2)
+        self.settings_scroll.ensureWidgetVisible(self.update_group)
+
+    def _open_update_checker(self):
+        self._show()
+        self._open_updates()
+        self._check_updates(manual=True)
+
+    def _open_release_page(self):
+        QDesktopServices.openUrl(QUrl(self.latest_release.url if self.latest_release else RELEASES_URL))
+
+    def check_updates_automatically(self):
+        if self.settings.auto_check_updates:
+            self._check_updates(manual=False)
+
+    def _check_updates(self, *, manual):
+        if self.update_worker or self._quitting or self._directory_switch_pending:
+            return
+        self.update_status_label.setText("正在检查 GitHub 最新正式版本…")
+        self._begin_update(UpdateWorker("check", manual=manual, parent=self))
+
+    def _begin_update(self, worker):
+        self.update_worker = worker
+        worker.checked.connect(self._update_checked)
+        worker.downloaded.connect(self._update_downloaded)
+        worker.progress.connect(self._update_download_progress)
+        worker.failed.connect(self._update_failed)
+        worker.cancelled.connect(self._update_cancelled)
+        worker.finished.connect(self._update_finished)
+        self.update_check_button.setEnabled(False)
+        self.sidebar_update_button.setEnabled(False)
+        self.update_download_button.setEnabled(False)
+        self.choose_directory_button.setEnabled(False)
+        self.update_progress.setRange(0, 0 if worker.mode == "check" else 100)
+        self.update_progress.setValue(0)
+        self.update_progress.show()
+        worker.start()
+
+    def _update_checked(self, result):
+        release = result.release
+        self.latest_release = release if result.available else None
+        self.update_notes.setPlainText(release.notes)
+        self.update_notes.setVisible(result.available)
+        if result.available:
+            suffix = "可以下载 Windows 更新包。" if release.asset else "尚未提供 Windows 更新包，可打开发布页查看。"
+            self.update_status_label.setText(f"发现新版本 {release.version}（当前 {result.current}），{suffix}")
+            self.update_banner_text.setText(f"发现新版本 {release.version}，可以下载更新。")
+            self.update_banner.show()
+            if self._notified_update_tag != release.tag:
+                self._notified_update_tag = release.tag
+                self.tray.showMessage("AutoDL Fresh 有新版本", f"{release.version} 已发布，可在偏好设置中下载更新。")
+        else:
+            message = f"当前已是最新正式版（{result.current}）。" if release.version == result.current else (
+                f"当前版本 {result.current}，GitHub 最新正式版 {release.version}，无需更新。")
+            self.update_status_label.setText(message)
+            self.update_banner.hide()
+
+    def _download_update(self):
+        if self.update_worker or not self.latest_release or not self.latest_release.asset or self._quitting or self._directory_switch_pending:
+            return
+        folder = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())
+        chosen, _ = QFileDialog.getSaveFileName(self, "保存 AutoDL Fresh 更新包",
+                                               str(Path(folder) / self.latest_release.asset.name), "ZIP 压缩包 (*.zip)")
+        if not chosen:
+            return
+        path = Path(chosen)
+        if path.suffix.lower() != ".zip":
+            self.update_status_label.setText("请使用 .zip 扩展名保存更新包。")
+            return
+        self.downloaded_update = None
+        self.update_folder_button.hide()
+        self.update_status_label.setText("正在后台下载更新包…")
+        self.update_cancel_button.setText("取消下载")
+        self.update_cancel_button.setEnabled(True)
+        self.update_cancel_button.show()
+        self._begin_update(UpdateWorker("download", release=self.latest_release, destination=path, parent=self))
+
+    def _update_download_progress(self, received, total):
+        self.update_progress.setValue(min(100, int(received * 100 / max(total, 1))))
+        self.update_progress.setFormat(f"%p% · {received / 1048576:.1f} / {total / 1048576:.1f} MB")
+
+    def _update_downloaded(self, path):
+        self.downloaded_update = Path(path)
+        self.update_status_label.setText(f"更新包已下载并通过校验：{path}。请安全退出软件后解压更新。")
+        self.update_folder_button.show()
+        self.tray.showMessage("AutoDL Fresh 更新包已下载", "已通过完整性校验，可打开下载目录。请先安全退出软件再解压更新。")
+
+    def _cancel_update(self):
+        if self.update_worker:
+            self.update_worker.cancel.set()
+            self.update_cancel_button.setEnabled(False)
+            self.update_cancel_button.setText("正在取消…")
+
+    def _update_cancelled(self):
+        self.update_status_label.setText("更新任务已取消，未完成的下载已清理。")
+
+    def _update_failed(self, message):
+        self.update_status_label.setText(message)
+        if self.update_worker and self.update_worker.manual:
+            self._log(f"软件更新：{message}")
+
+    def _update_finished(self):
+        worker = self.update_worker
+        self.update_worker = None
+        if worker:
+            worker.deleteLater()
+        self.update_progress.hide()
+        self.update_cancel_button.hide()
+        self.update_check_button.setEnabled(True)
+        self.sidebar_update_button.setEnabled(True)
+        self.update_download_button.setEnabled(bool(self.latest_release and self.latest_release.asset))
+        self.choose_directory_button.setEnabled(not bool(os.environ.get("AUTODL_FRESH_DATA_DIR")))
+        if self._quitting and not self.worker:
+            QApplication.quit()
+
+    def _open_download_folder(self):
+        if self.downloaded_update:
+            open_directory(self.downloaded_update.parent)
+
     def _log(self, text):
         line = f"{now():%Y-%m-%d %H:%M:%S}  {text}"
         self.logs.appendPlainText(line)
@@ -557,6 +731,8 @@ class MainWindow(QMainWindow):
             self._log("正在确认登录状态并保存，请稍候…")
 
     def _start(self, mode, *, scheduled=False):
+        if self._quitting:
+            return
         if self._directory_switch_pending:
             self._log("数据目录已切换，请重启应用后再执行操作。")
             return
@@ -606,7 +782,7 @@ class MainWindow(QMainWindow):
         self.stop_button.hide()
         self.progress.hide()
         self._update_status()
-        if self._quitting:
+        if self._quitting and not self.update_worker:
             QApplication.quit()
 
     def _cancel(self):
@@ -778,6 +954,9 @@ class MainWindow(QMainWindow):
     def _save_settings(self):
         if self.worker or self._directory_switch_pending:
             return
+        if self.update_worker and self._pending_data_dir != self.store.root.resolve():
+            self.save_feedback.setText("请先等待更新任务完成或取消下载，再切换数据目录。")
+            return
         updated = replace(
             self.settings, schedule_enabled=self.schedule_check.isChecked(),
             daily_time=self.daily_time.time().toString("HH:mm"), threshold_days=self.threshold.value(),
@@ -785,6 +964,7 @@ class MainWindow(QMainWindow):
             browser_visibility=self.browser_visibility.currentData(),
             headless=self.browser_visibility.currentData() == "background",
             browser_mode=self.browser_mode.currentData(),
+            auto_check_updates=self.auto_update_check.isChecked(),
             timeout_seconds=self.timeout.value(), poll_seconds=self.poll.value(),
             minimize_to_tray=self.tray_check.isChecked(), start_with_windows=self.startup.isChecked(),
         )
@@ -814,7 +994,7 @@ class MainWindow(QMainWindow):
             self.save_feedback.setText(str(exc))
 
     def _choose_data_directory(self):
-        if self.worker or self._directory_switch_pending:
+        if self.worker or self.update_worker or self._directory_switch_pending:
             return
         selected = QFileDialog.getExistingDirectory(self, "选择新的空数据目录", str(self.store.root.parent))
         if selected:
@@ -852,7 +1032,7 @@ class MainWindow(QMainWindow):
         self._snapshot_hint()
 
     def _tick(self):
-        if self.worker or not self.auth_valid:
+        if self.worker or self._quitting or not self.auth_valid:
             return
         state = self.store.read("scheduler.json", {})
         if schedule_due(self.settings, state.get("last_attempt", ""), now()):
@@ -862,10 +1042,15 @@ class MainWindow(QMainWindow):
 
     def _quit(self):
         self._quitting = True
+        self.timer.stop()
+        if self.update_worker:
+            self._cancel_update()
         if self.worker:
             self._cancel()
             self._show()
             self._log("正在安全结束任务，完成当前实例核验后退出。")
+        elif self.update_worker:
+            self._log("正在结束更新任务，完成下载清理后退出。")
         else:
             QApplication.quit()
 
@@ -876,7 +1061,7 @@ class MainWindow(QMainWindow):
             if not self._shown_tray_hint:
                 self.tray.showMessage("AutoDL Fresh", "应用仍在托盘运行，每日计划继续生效。可从托盘菜单退出。")
                 self._shown_tray_hint = True
-        elif self.worker:
+        elif self.worker or self.update_worker:
             event.ignore()
             self._quit()
         else:

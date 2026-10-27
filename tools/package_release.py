@@ -1,16 +1,22 @@
 """Package the Windows folder with notices, without personal runtime data."""
 from __future__ import annotations
 
+import argparse
 import hashlib
 from pathlib import Path
 import shutil
+import tomllib
 import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
+VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
 
 
 def main():
-    app = ROOT / "dist" / "AutoDLFresh"
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--app-dir", type=Path, default=ROOT / "dist" / "AutoDLFresh")
+    args = parser.parse_args()
+    app = args.app_dir.resolve()
     if not (app / "AutoDLFresh.exe").is_file():
         raise SystemExit("Build dist/AutoDLFresh first.")
     for name in ("README.md", "LICENSE", "CHANGELOG.md", "THIRD_PARTY_NOTICES.md"):
@@ -23,12 +29,12 @@ def main():
         raise SystemExit("Unexpected runtime/private data found in the release folder.")
     releases = ROOT / "releases"
     releases.mkdir(exist_ok=True)
-    artifact = releases / "AutoDLFresh-0.5.0-windows-x64.zip"
+    artifact = releases / f"AutoDLFresh-{VERSION}-windows-x64.zip"
     with zipfile.ZipFile(artifact, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
         for file in sorted(files):
             archive.write(file, Path("AutoDLFresh") / file.relative_to(app))
     assets = [artifact]
-    source = releases / "AutoDLFresh-0.5.0-third-party-sources.zip"
+    source = releases / f"AutoDLFresh-{VERSION}-third-party-sources.zip"
     if source.exists():
         assets.append(source)
     checksums = releases / "SHA256SUMS.txt"
