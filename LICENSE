@@ -1,0 +1,66 @@
+AutoDL Fresh 非商业使用许可协议 1.0
+AutoDL Fresh Non-Commercial License 1.0
+
+Copyright (c) 2026 wanfeng562-code. All rights reserved.
+版权人：GitHub 账号 wanfeng562-code 的持有人。
+
+一、适用范围与版权
+本协议适用于版权人享有权利的 AutoDL Fresh 原创源代码、程序、界面、
+图标及项目文档（合称“本软件”）。公开源码、提供下载或接受贡献，均不
+表示放弃版权、转让所有权或授予本协议未明确列明的权利。
+
+二、非商业许可
+在遵守本协议的前提下，版权人免费授予你非独占、不可转让的权利，允许
+你为非商业目的下载、安装、运行、研究、复制、修改本软件，并免费分享
+本软件及其修改版本。分享时必须保留本协议、版权声明和第三方声明，
+注明修改内容，不得暗示修改版本由版权人发布、认可或担保，也不得对
+版权人的原始软件授予商业权利。
+
+三、商业使用限制
+未经版权人事先单独书面授权，任何其他个人或组织不得将本软件用于商业
+目的。商业目的包括但不限于：销售、收费分发、出租、付费支持或代运营；
+将其嵌入商业产品或付费服务；提供收费托管、SaaS、API 或广告变现服务；
+为雇主、客户或营利性业务提供生产、运营、培训、咨询或其他利益支持。
+免费提供软件或服务不当然构成非商业使用；间接获利或支持商业业务的
+使用同样需要单独授权。不确定是否属于商业用途时，应先联系版权人。
+
+四、版权人的保留权利
+本协议第三条不限制版权人本人使用、修改、分发、销售、运营或以其他
+方式商业化自己的原创软件。版权人保留为任何个人或组织另行提供商业
+许可、双重许可或其他授权的权利。版权人使用第三方组件时，仍须遵守
+这些组件各自的许可。
+
+五、第三方组件与法定权利
+第三方组件、其源码及其版权不属于本协议的原创软件范围，仍分别适用
+它们自身的许可；详见 THIRD_PARTY_NOTICES.md 和 licenses/third-party。
+本协议不限制任何第三方许可授予的权利，尤其不限制用户修改、替换或
+重新链接 LGPL 库，或为调试这些修改而进行逆向工程。本软件与修改后
+的、接口兼容的 LGPL 库重新组合或链接所必需的行为亦被允许。
+本协议不限制适用法律规定且不可排除的权利。
+
+六、不提供担保
+在适用法律允许的范围内，本软件按“现状”提供，不作明示或默示担保，
+包括适销性、特定用途适用性及不侵权担保。版权人不对因使用或无法使用
+本软件而产生的损失承担责任。使用者应自行评估用途、备份数据并承担
+云服务计费等实际使用责任。
+
+七、终止与其他条款
+违反本协议时，本协议授予的许可自动终止；法律或第三方许可另有规定
+的除外。未获授予的权利均由版权人保留。本协议不授予商标、品牌背书
+或专利许可。任何条款无效不影响其他条款的效力。
+
+商业授权和版权事务：
+https://github.com/wanfeng562-code/autodl-fresh/issues
+
+English summary (the Chinese terms above govern):
+You may download, use, study, modify and redistribute the original AutoDL Fresh
+software free of charge for non-commercial purposes only, retaining this license,
+copyright notices and third-party notices and identifying modifications.
+Commercial use by anyone other than the copyright holder requires separate prior
+written permission. The copyright holder reserves all commercial and relicensing
+rights to their original work. Third-party components retain their own licenses;
+their modification, replacement, relinking and debugging rights are unaffected.
+The software is supplied AS IS, without warranty to the extent permitted by law.
+
+This is a source-available, non-commercial license, not an OSI-approved
+open-source license. It is not MIT, Apache-2.0, or GPL licensing of this app.
