@@ -65,22 +65,26 @@ def browser_executable(channel: str, chromium_path: str | None = None) -> Path:
     raise RuntimeError("未找到所选浏览器。请先安装 Edge / Chrome，或在设置中选择已安装的浏览器。")
 
 
-def browser_args(executable: Path, profile: Path, url: str, port: int) -> list[str]:
+def browser_args(executable: Path, profile: Path, url: str, port: int, *, background=False) -> list[str]:
     if not 1 <= port <= 65535:
         raise ValueError("浏览器连接端口无效")
     return [str(executable), f"--user-data-dir={profile}", "--remote-debugging-address=127.0.0.1",
             f"--remote-debugging-port={port}", "--disable-extensions", "--disable-sync",
             "--disable-features=msImplicitSignin", "--no-first-run", "--no-default-browser-check",
-            "--new-window", url]
+            *(["--start-minimized"] if background else []), "--new-window", url]
 
 
 class NativeBrowser:
-    def __init__(self, settings: Settings, store: Store):
+    def __init__(self, settings: Settings, store: Store, *, window_mode=None):
         self.settings = settings
         self.store = store
+        self.window_mode = window_mode or ("foreground" if settings.browser_visibility == "foreground" else "minimized")
         # New namespace deliberately never reuses v0.2 profiles, which may have
         # implicitly signed into Microsoft and downloaded personal extensions.
         self.profile = store.root / f"{PROFILE_PREFIX}-{settings.browser_channel}"
+        if self.window_mode == "hidden":
+            # Idle quotation work must never hide or close a manual/rental window.
+            self.profile = self.profile.with_name(self.profile.name + "-quotes")
         self.port_file = self.profile / "FreshDebugPort"
         self.fresh_profile = not (self.profile / "Default").exists()
         self.process = None
@@ -106,13 +110,14 @@ class NativeBrowser:
                 listener.bind(("127.0.0.1", 0))
                 port = listener.getsockname()[1]
             self.port_file.write_text(str(port), encoding="utf-8")
+        background = not login and self.window_mode != "foreground"
         args = browser_args(browser_executable(self.settings.browser_channel, chromium_path), self.profile,
-                            self.settings.console_url if login else STARTUP_URL, port)
+                            self.settings.console_url if login else STARTUP_URL, port, background=background)
         options = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
         if sys.platform == "win32":
             info = subprocess.STARTUPINFO()
             info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            info.wShowWindow = 1 if login or self.settings.browser_visibility == "foreground" else 7
+            info.wShowWindow = 1 if login or self.window_mode == "foreground" else 0 if self.window_mode == "hidden" else 7
             options["startupinfo"] = info
             options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         self.process = launch_external(args, **options)

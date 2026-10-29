@@ -11,11 +11,14 @@ from autodl_fresh.storage import Store
 from autodl_fresh.ui import MainWindow
 from autodl_fresh.updater import ReleaseAsset, ReleaseInfo, UpdateCancelled, UpdateCheck, UpdateError
 
+FUTURE_VERSION = f"{int(__version__.split('.')[0]) + 1}.0.0"
+
 
 def release_info(asset=True):
-    return ReleaseInfo("v0.7.0", "0.7.0", "https://github.com/wanfeng562-code/autodl-fresh/releases/tag/v0.7.0",
+    return ReleaseInfo(f"v{FUTURE_VERSION}", FUTURE_VERSION,
+                       f"https://github.com/wanfeng562-code/autodl-fresh/releases/tag/v{FUTURE_VERSION}",
                        "新功能\n<script>plain text, never HTML</script>",
-                       ReleaseAsset("AutoDLFresh-0.7.0-windows-x64.zip", "https://github.com/fixture", 10) if asset else None)
+                       ReleaseAsset(f"AutoDLFresh-{FUTURE_VERSION}-windows-x64.zip", "https://github.com/fixture", 10) if asset else None)
 
 
 def wait_finished(window):
@@ -60,7 +63,7 @@ def test_check_prompt_download_and_open_folder_do_not_interrupt_browser_work(tmp
         window.update_check_button.click()
         wait_finished(window)
         assert window.worker is browser_work
-        assert "0.7.0" in window.update_status_label.text()
+        assert FUTURE_VERSION in window.update_status_label.text()
         assert not window.update_banner.isHidden()
         assert window.update_download_button.isEnabled()
         assert "<script>" in window.update_notes.toPlainText()

@@ -1,6 +1,6 @@
 # Third-party notices and corresponding source
 
-AutoDL Fresh 0.6.0 uses independently licensed third-party software. The project's
+AutoDL Fresh 0.7.5 uses independently licensed third-party software. The project's
 non-commercial license applies only to the copyright holder's original work.
 It does **not** replace, narrow, or claim ownership over any third-party license.
 
@@ -19,7 +19,7 @@ No commercial Qt license is represented as having been acquired.
 Full license texts, including the GPLv3 text incorporated by LGPLv3 and embedded
 third-party attributions, are included under `licenses/third-party`.
 
-The same [v0.6.0 release](https://github.com/wanfeng562-code/autodl-fresh/releases/tag/v0.6.0)
+The [v0.6.0 release](https://github.com/wanfeng562-code/autodl-fresh/releases/tag/v0.6.0)
 offers **AutoDLFresh-0.6.0-third-party-sources.zip**, containing the complete,
 unmodified source archives for the Qt components shipped by this application:
 
@@ -45,7 +45,7 @@ configuration. See the LICENSE exception protecting these third-party rights.
 
 ## Other components
 
-| Component | Version in 0.6.0 | Upstream license / notices |
+| Component | Version in 0.7.5 | Upstream license / notices |
 | --- | --- | --- |
 | CPython runtime | 3.12.4 | Python Software Foundation license and bundled third-party notices |
 | Playwright for Python / driver | 1.64.1 | Apache-2.0; upstream NOTICE and ThirdPartyNotices.txt |

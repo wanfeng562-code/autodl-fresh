@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 import threading
 import time
 
@@ -8,7 +9,7 @@ from PySide6.QtCore import QThread, Signal
 
 from playwright.sync_api import Error as PlaywrightError
 
-from .browser import SessionExpired, browser_session, save_auth
+from .browser import Cancelled, InventoryUnavailable, SessionExpired, browser_session, save_auth
 from .engine import RefreshEngine
 from .native_browser import NativeBrowser
 from .browser_ui import show_login_saved
@@ -22,14 +23,20 @@ class BrowserWorker(QThread):
     auth_expired = Signal()
     login_ready = Signal()
     logged_in = Signal()
+    rental_catalog = Signal(object)
+    rental_updated = Signal(object)
 
     def __init__(self, settings, store, mode, parent=None):
         super().__init__(parent)
-        self.settings = settings
+        if mode not in {"login", "preview", "refresh", "refresh_all", "resolve", "rental_probe", "rental", "rental_verify"}:
+            raise ValueError("不支持的浏览器任务")
+        self.settings = (replace(settings, browser_visibility="background", headless=True)
+                         if mode in {"preview", "rental_probe"} else settings)
         self.store = store
         self.mode = mode
         self.cancel = threading.Event()
         self.save_login = threading.Event()
+        self.rental_options = None
 
     def run(self):
         try:
@@ -40,6 +47,45 @@ class BrowserWorker(QThread):
                 console.log = self.log.emit
                 for message in getattr(console, "browser_warnings", []):
                     self.log.emit(message)
+                if self.mode.startswith("rental"):
+                    from .rental_browser import CloneConsole
+                    from .rental import RentalEngine
+                    adapter = CloneConsole(console)
+                    adapter.cancel = self.cancel
+                    if self.mode == "rental_probe":
+                        from .quote_cache import QuoteCache
+                        cache = QuoteCache(self.store)
+                        def catalog_changed(data, *, complete=False):
+                            data = cache.update(data, complete=complete)
+                            self.rental_catalog.emit(deepcopy(data))
+                        for attempt in range(3):
+                            if self.cancel.is_set():
+                                raise Cancelled("已停止读取 GPU 型号与参考报价")
+                            try:
+                                adapter.prepare(self.rental_options.source_uuid)
+                                catalog_changed(adapter.catalog(include_prices=True, cancel=self.cancel,
+                                                                changed=catalog_changed), complete=True)
+                                break
+                            except InventoryUnavailable:
+                                if attempt == 2:
+                                    raise
+                                self.log.emit("本次读取暂未完成，正在后台重试…")
+                                console.page.wait_for_timeout(1000)
+                    else:
+                        def rental_changed(task):
+                            adapter.show_status(task)
+                            self.rental_updated.emit(deepcopy(task))
+                        adapter.on_running = rental_changed
+                        result = RentalEngine(
+                            adapter, self.store, self.rental_options, log=self.log.emit,
+                            changed=rental_changed, cancel=self.cancel,
+                        ).run(recover=self.mode == "rental_verify")
+                        if result["phase"] in {"failed", "uncertain"}:
+                            if "登录" in result["message"]:
+                                self.auth_expired.emit()
+                            self.failed.emit(result["message"])
+                    save_auth(context, self.store)
+                    return
                 if self.mode == "login":
                     console.page.goto(self.settings.console_url, wait_until="domcontentloaded")
                     self.login_ready.emit()
@@ -89,6 +135,10 @@ class BrowserWorker(QThread):
                 if any("登录" in error for error in report.errors):
                     self.auth_expired.emit()
                 self.completed.emit(deepcopy(report))
+        except Cancelled as exc:
+            self.log.emit(str(exc))
+            if self.mode == "rental_probe":
+                self.rental_updated.emit({"phase": "cancelled", "message": "已停止读取 GPU 型号与参考报价"})
         except SessionExpired as exc:
             self.auth_expired.emit()
             self.failed.emit(str(exc))

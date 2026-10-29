@@ -74,7 +74,14 @@ def test_background_session_preserves_active_tab_and_cleans_blanks(tmp_path):
         def log_message(self, *args):
             pass
 
-    server = HTTPServer(("127.0.0.1", 0), Handler)
+    for port in range(20100, 20200):
+        try:
+            server = HTTPServer(("127.0.0.1", port), Handler)
+            break
+        except OSError:
+            continue
+    else:
+        raise RuntimeError("No free safe fixture port")
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     url = f"http://127.0.0.1:{server.server_port}"
@@ -97,13 +104,16 @@ def test_background_session_preserves_active_tab_and_cleans_blanks(tmp_path):
             assert probe.evaluate("document.visibilityState") == "hidden"
             assert selected_title(native, "Original")
             probe.close()
-        previous_foreground = foreground_process()
         with browser_session(Settings(browser_visibility="background"), store) as (console, context):
+            assert not any(page.url == STARTUP_URL for page in context.pages if page is not console.page)
             console.page.goto(url + "/work")
             console.page.get_by_role("button", name="Click", exact=True).click()
             assert console.page.get_by_role("button", name="Clicked").count() == 1
             assert selected_title(native, "Original")
-            assert foreground_process() == previous_foreground
+            client = context.new_cdp_session(console.page)
+            target = client.send('Target.getTargetInfo')['targetInfo']['targetId']
+            assert client.send('Browser.getWindowForTarget', {'targetId':target})['bounds']['windowState'] == 'minimized'
+            client.detach()
         with sync_playwright() as pw:
             browser = pw.chromium.connect_over_cdp(native.endpoint(), no_defaults=True)
             assert [page.url for page in browser.contexts[0].pages] == [url + "/"]
@@ -129,6 +139,7 @@ def test_check_only_browser_leaves_no_empty_window(tmp_path):
     store = Store(tmp_path)
     native = NativeBrowser(Settings(), store)
     with browser_session(Settings(), store) as (console, context):
+        assert len(context.pages) == 1  # Reuse the initial tab, never add a spare blank.
         console.page.set_content("<title>Working</title>")
     deadline = time.monotonic() + 5
     try:
@@ -140,3 +151,95 @@ def test_check_only_browser_leaves_no_empty_window(tmp_path):
             time.sleep(0.1)
     finally:
         close_native(native)
+
+
+def test_background_cold_start_stays_minimized_and_keeps_dom_working(tmp_path):
+    store = Store(tmp_path)
+    native = NativeBrowser(Settings(), store)
+    try:
+        with browser_session(Settings(), store, native=native) as (console, context):
+            console.page.set_content('<title>Silent reading</title><button onclick="this.textContent=\'Read\'">Read instances</button>')
+            console.page.get_by_role("button", name="Read instances").click()
+            assert len(context.pages) == 1
+            client = context.new_cdp_session(console.page)
+            info = client.send("Target.getTargetInfo")["targetInfo"]
+            bounds = client.send("Browser.getWindowForTarget", {"targetId": info["targetId"]})["bounds"]
+            assert bounds["windowState"] == "minimized"
+            client.detach()
+    finally:
+        close_native(native)
+
+
+def test_read_worker_uses_ordinary_minimized_browser(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from playwright.sync_api import BrowserType
+    from autodl_fresh import worker as worker_module
+    from autodl_fresh.worker import BrowserWorker
+    from test_browser import FakeSite
+    store = Store(tmp_path)
+    store.write('auth.json', {'cookies':[], 'origins':[]})
+    settings = Settings(browser_visibility='foreground', browser_mode='native',
+                        console_url='http://127.0.0.1:18937/console/instance/list')
+    monkeypatch.setattr(Settings, 'validate', lambda self: None)
+    launches = []
+    original_launch = BrowserType.launch
+    def launch(self, *args, **kwargs):
+        launches.append(kwargs.get('headless'))
+        return original_launch(self, *args, **kwargs)
+    monkeypatch.setattr(BrowserType, 'launch', launch)
+    site = FakeSite()
+    states = []
+    @contextmanager
+    def intercepted(settings, store, **kwargs):
+        with browser_session(settings, store, **kwargs) as (console, context):
+            context.route('**/*', site.route)
+            client = context.new_cdp_session(console.page)
+            target = client.send('Target.getTargetInfo')['targetInfo']['targetId']
+            states.append(client.send('Browser.getWindowForTarget', {'targetId': target})['bounds']['windowState'])
+            client.detach()
+            yield console, context
+    monkeypatch.setattr(worker_module, 'browser_session', intercepted)
+    reports, failures = [], []
+    worker = BrowserWorker(settings, store, 'preview')
+    worker.completed.connect(reports.append)
+    worker.failed.connect(failures.append)
+    worker.run()
+    assert launches == [] and states == ['minimized'] and not failures
+    assert len(reports) == 1 and len(reports[0].instances) == 4 and not reports[0].errors
+    assert not site.events
+
+
+def test_hidden_quote_window_has_no_visible_taskbar_window_and_uses_separate_profile(tmp_path):
+    settings, store = Settings(), Store(tmp_path)
+    normal = NativeBrowser(settings, store)
+    hidden = NativeBrowser(settings, store, window_mode="hidden")
+    assert normal.profile != hidden.profile
+    previous_foreground = foreground_process()
+    visible = []
+    try:
+        with browser_session(settings, store, native=hidden, window_mode="hidden") as (console, context):
+            console.page.set_content('<title>Hidden fixture quotes</title><button onclick="this.textContent=\'Read\'">Read quotes</button>')
+            console.page.get_by_role('button', name='Read quotes').click()
+            assert console.page.get_by_role('button', name='Read', exact=True).count() == 1
+            user32 = ctypes.windll.user32
+            user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+            user32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+            client = console.page.context.browser.new_browser_cdp_session()
+            processes = client.send('SystemInfo.getProcessInfo')['processInfo']
+            process_id = next(int(p['id']) for p in processes if p['type'] == 'browser')
+            client.detach()
+            callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+            def visit(hwnd, _):
+                owner = ctypes.c_ulong()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+                if owner.value == process_id:
+                    name = ctypes.create_unicode_buffer(256)
+                    user32.GetClassNameW(hwnd, name, len(name))
+                    if name.value == 'Chrome_WidgetWin_1':
+                        visible.append(bool(user32.IsWindowVisible(hwnd)))
+                return True
+            user32.EnumWindows(callback_type(visit), 0)
+            assert visible == [False]
+            assert foreground_process() == previous_foreground
+    finally:
+        close_native(hidden)

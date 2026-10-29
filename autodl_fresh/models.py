@@ -39,6 +39,8 @@ class Instance:
     page: int = 1
     blocked_reason: str = ""
     retention_days: int = 15
+    gpu_name: str = ""
+    gpu_count: int = 0
 
     def reason(self, threshold_days: int, *, refresh_all: bool = False) -> str:
         if self.blocked_reason:

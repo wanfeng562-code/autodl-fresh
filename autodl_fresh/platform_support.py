@@ -10,6 +10,32 @@ import time
 _launch_lock = threading.Lock()
 
 
+def background_browser_windows(process_id: int, *, hidden=False) -> int:
+    """Change only top-level Chromium windows owned by the dedicated browser PID."""
+    if sys.platform != "win32":
+        return 0
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    changed = []
+    def visit(hwnd, _):
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == process_id:
+            name = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(hwnd, name, len(name))
+            if name.value == "Chrome_WidgetWin_1":
+                user32.ShowWindow(hwnd, 0 if hidden else 7)  # SW_HIDE / SW_SHOWMINNOACTIVE
+                changed.append(hwnd)
+        return True
+    user32.EnumWindows(callback_type(visit), 0)
+    return len(changed)
+
+
 def activate_browser_window(marker: str) -> bool:
     """Raise the dedicated work window by its temporary unique tab title.
 

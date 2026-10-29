@@ -22,6 +22,7 @@ from .widgets import protect_settings_scroll
 from .storage import Store
 from .worker import BrowserWorker
 from .updater import RELEASES_URL, UpdateWorker
+from .rental_ui import RentalPanel
 from . import __version__
 
 
@@ -37,7 +38,7 @@ QLabel#brandSub { color: #a4bdb2; font-size: 12px; }
 QLabel#sideNote { color: #aac1b6; font-size: 12px; }
 QLabel#eyebrow { color: #289473; font-weight: 600; font-size: 11px; }
 QListWidget#nav { background: transparent; border: none; color: #a9c1b5; outline: none; }
-QListWidget#nav::item { height: 48px; padding-left: 18px; border-radius: 8px; margin: 3px 0; }
+QListWidget#nav::item { height: 42px; padding-left: 18px; border-radius: 8px; margin: 2px 0; }
 QListWidget#nav::item:selected { background: #29483b; color: #edfff6; font-weight: 600; border-left: 3px solid #66d6a4; }
 QListWidget#nav::item:hover { background: #203d31; }
 QFrame#card, QGroupBox { background: #fff; border: 1px solid #e0e9e4; border-radius: 10px; }
@@ -56,8 +57,8 @@ QPushButton#danger { color: #ac563e; }
 QTableWidget { background: #fff; border: none; gridline-color: #edf1ee; selection-background-color: #eaf5ee; selection-color: #233d2d; outline: none; }
 QTableWidget::item { padding: 9px; border-bottom: 1px solid #edf1ee; }
 QHeaderView::section { background: #f8faf8; border: none; border-bottom: 1px solid #e5ece7; color: #708277; padding: 12px 8px; font-weight: 500; }
-QLineEdit, QComboBox, QSpinBox, QTimeEdit { background: #fff; color: #243b33; border: 1px solid #d7e2dc; border-radius: 6px; padding: 8px; min-height: 18px; }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QTimeEdit:focus { border-color: #278d64; }
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTimeEdit { background: #fff; color: #243b33; border: 1px solid #d7e2dc; border-radius: 6px; padding: 8px; min-height: 18px; }
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTimeEdit:focus { border-color: #278d64; }
 QComboBox QAbstractItemView { background: white; color: #243b33; selection-background-color: #e1f0e7; }
 QCheckBox { color: #314b3d; spacing: 9px; padding: 6px 0; }
 QCheckBox::indicator { width: 18px; height: 18px; border: 1px solid #c0d2c6; background: white; border-radius: 4px; }
@@ -159,13 +160,15 @@ class MainWindow(QMainWindow):
         self.latest_release = None
         self.downloaded_update = None
         self._notified_update_tag = ""
+        self._notified_rentals = set()
+        self.rental_completed_uuid = ""
         self.report: RunReport | None = None
         self.auth_valid = store.auth_path.exists()
         self._quitting = False
         self._scheduled_run = False
         self._shown_tray_hint = False
         self._current_page = 1
-        self.setWindowTitle("AutoDL Fresh · 实例保活助手")
+        self.setWindowTitle("AutoDL Fresh · 实例保活与 GPU 候租")
         self.setWindowIcon(app_icon())
         self.resize(1230, 840)
         self.setMinimumSize(1080, 720)
@@ -195,10 +198,10 @@ class MainWindow(QMainWindow):
         side.addSpacing(14)
         side.addWidget(label("AutoDL Fresh", "brand"))
         side.addWidget(label("让每一个实例，安心留存", "brandSub"))
-        side.addSpacing(38)
+        side.addSpacing(24)
         self.nav = QListWidget()
         self.nav.setObjectName("nav")
-        self.nav.addItems(["实例总览", "执行记录", "偏好设置", "使用指南"])
+        self.nav.addItems(["实例总览", "执行记录", "偏好设置", "使用指南", "GPU 候租"])
         self.nav.setSpacing(3)
         self.nav.setCurrentRow(0)
         self.nav.currentRowChanged.connect(lambda index: self.stack.setCurrentIndex(index))
@@ -228,11 +231,25 @@ class MainWindow(QMainWindow):
         banner_row.addWidget(button("稍后", self.update_banner.hide))
         self.update_banner.hide()
         layout.addWidget(self.update_banner)
+        self.rental_success_banner = card("hero")
+        success_row = QHBoxLayout(self.rental_success_banner)
+        self.rental_success_text = label("", "heroTitle", True)
+        success_row.addWidget(self.rental_success_text, 1)
+        success_row.addWidget(button("查看租用结果", self._open_rental_result))
+        success_row.addWidget(button("复制实例 ID", lambda: QApplication.clipboard().setText(self.rental_completed_uuid)))
+        success_row.addWidget(button("关闭提示", self.rental_success_banner.hide))
+        self.rental_success_banner.hide()
+        layout.addWidget(self.rental_success_banner)
         self.stack = QStackedWidget()
         self.stack.addWidget(self._overview())
         self.stack.addWidget(self._records())
         self.stack.addWidget(self._preferences())
         self.stack.addWidget(self._guide())
+        self.rental_panel = RentalPanel(self.store)
+        self.rental_panel.requested.connect(self._request_rental)
+        self.rental_panel.stop_requested.connect(self._cancel)
+        self.rental_panel.logged.connect(self._rental_log)
+        self.stack.addWidget(self.rental_panel)
         layout.addWidget(self.stack)
         bottom = QHBoxLayout()
         self.status_text = label("就绪 · 首先登录 AutoDL", "muted")
@@ -273,6 +290,9 @@ class MainWindow(QMainWindow):
         self.resolve_button = button("解除暂停", self._resolve_pending)
         self.resolve_button.hide()
         hero_row.addWidget(self.resolve_button)
+        self.rental_pending_button = button("查看候租", lambda: self.nav.setCurrentRow(4))
+        self.rental_pending_button.hide()
+        hero_row.addWidget(self.rental_pending_button)
         self.login_button = button("登录 AutoDL", self._login, True)
         hero_row.addWidget(self.login_button)
         layout.addWidget(hero)
@@ -452,11 +472,11 @@ class MainWindow(QMainWindow):
         form.addRow("连接方式", self.browser_mode)
         form.addRow(label("专用窗口禁止浏览器账号登录、同步及用户扩展。应用仅保存 AutoDL 登录态；手动登录完成后才接管页面。", "muted", True))
         self.browser_visibility = QComboBox()
-        self.browser_visibility.addItem("后台静默（默认，不唤醒浏览器）", "background")
+        self.browser_visibility.addItem("后台运行（最小化专用浏览器）", "background")
         self.browser_visibility.addItem("前台显示（切换到当前操作实例）", "foreground")
         self.browser_visibility.setCurrentIndex(self.browser_visibility.findData(self.settings.browser_visibility))
         form.addRow("操作时显示方式", self.browser_visibility)
-        form.addRow(label("适用于只读检查、刷新和核验。手动登录始终打开可见窗口；后台操作不切换你正在看的标签页。", "muted", True))
+        form.addRow(label("后台启动普通浏览器后最小化，网页继续操作。实例和 GPU 型号读取始终后台；候租、刷新和核验按此选项显示。手动登录始终可见。", "muted", True))
         self.timeout = QSpinBox()
         self.timeout.setRange(30, 900)
         self.timeout.setSingleStep(30)
@@ -578,6 +598,7 @@ class MainWindow(QMainWindow):
         self.tray.setToolTip("AutoDL Fresh · 实例保活助手")
         menu = QMenu(self)
         for text, handler in [("显示主窗口", self._show), ("只读检查", lambda: self._start("preview")),
+                              ("GPU 候租", lambda: (self._show(), self.nav.setCurrentRow(4))),
                               ("检查并刷新", lambda: self._start("refresh")), ("检查更新", self._open_update_checker)]:
             action = QAction(text, self)
             action.triggered.connect(handler)
@@ -730,7 +751,10 @@ class MainWindow(QMainWindow):
             self.worker.save_login.set()
             self._log("正在确认登录状态并保存，请稍候…")
 
-    def _start(self, mode, *, scheduled=False):
+    def _request_rental(self, mode, options):
+        self._start(mode, rental_options=options)
+
+    def _start(self, mode, *, scheduled=False, rental_options=None):
         if self._quitting:
             return
         if self._directory_switch_pending:
@@ -738,12 +762,20 @@ class MainWindow(QMainWindow):
             return
         if self.worker:
             return
+        if mode in {"refresh", "refresh_all", "resolve"}:
+            from .rental import PENDING_PHASES
+            if self.store.read("rental-task.json", {}).get("phase") in PENDING_PHASES:
+                self._log("候租的创建结果尚未核验，请先到 GPU 候租页处理。")
+                return
         if mode != "login" and not self.auth_valid:
             self._log("请先登录 AutoDL 并保存登录态。")
             self.nav.setCurrentRow(0)
             return
         self._scheduled_run = scheduled
         self.worker = BrowserWorker(replace(self.settings), self.store, mode, self)
+        self.worker.rental_options = rental_options
+        self.worker.rental_catalog.connect(self.rental_panel.catalog_ready)
+        self.worker.rental_updated.connect(self._rental_updated)
         self.worker.log.connect(self._log)
         self.worker.updated.connect(self._receive_report)
         self.worker.completed.connect(self._completed)
@@ -752,16 +784,45 @@ class MainWindow(QMainWindow):
         self.worker.login_ready.connect(lambda: self.save_login_button.show())
         self.worker.logged_in.connect(self._logged_in)
         self.worker.finished.connect(self._worker_finished)
+        self.rental_panel.set_busy(True, mode)
         for item in (self.login_button, self.preview_button, self.run_button, self.run_all_button, self.save_button, self.resolve_button):
             item.setEnabled(False)
         self.stop_button.show()
         self.stop_button.setEnabled(True)
         self.progress.setRange(0, 0)
         self.progress.show()
-        self.operation_label.setText("正在登录…" if mode == "login" else "正在检查全部分页…")
+        self.operation_label.setText("正在登录…" if mode == "login" else "正在处理 GPU 候租…"
+                                     if mode.startswith("rental") else "正在检查全部分页…")
         self._log({"login": "打开手动登录窗口", "preview": "开始只读检查", "refresh": "开始检查并刷新",
-                   "refresh_all": "开始全部刷新（不限剩余天数）", "resolve": "核对待处理实例是否已关机"}[mode])
+                   "refresh_all": "开始全部刷新（不限剩余天数）", "resolve": "核对待处理实例是否已关机",
+                   "rental_probe": "读取克隆页面 GPU 型号（不创建）", "rental": "开始 GPU 候租",
+                   "rental_verify": "核验已创建实例（不重新下单）"}[mode])
         self.worker.start()
+
+    def _rental_updated(self, task):
+        self.rental_panel.show_task(task)
+        self.operation_label.setText(task.get("message", "正在候租…"))
+        self._update_status()
+        uuid = task.get("target_uuid", "")
+        if task.get("phase") == "completed" and uuid:
+            self.rental_success_text.setText("GPU 已运行，数据盘已就绪 · " + uuid)
+        if task.get("phase") in {"gpu_running", "completed"} and uuid and uuid not in self._notified_rentals:
+            self._notified_rentals.add(uuid)
+            self.rental_completed_uuid = uuid
+            if task["phase"] == "gpu_running":
+                self.rental_success_text.setText("GPU 已租到并开机，正在核验数据盘 · " + uuid)
+            self.rental_success_banner.show()
+            self.tray.showMessage("GPU 已租到并开机", task["message"][:240], QSystemTrayIcon.MessageIcon.Information, 15000)
+            QApplication.beep()
+            QApplication.alert(self, 10000)
+
+    def _open_rental_result(self):
+        self._show()
+        self.nav.setCurrentRow(4)
+
+    def _rental_log(self, message):
+        self._log(message)
+        self._update_status()
 
     def _auth_expired(self):
         self.auth_valid = False
@@ -781,6 +842,9 @@ class MainWindow(QMainWindow):
         self.save_login_button.hide()
         self.stop_button.hide()
         self.progress.hide()
+        self.rental_panel.set_busy(False)
+        if self.report:
+            self.rental_panel.set_instances(self.report.instances)
         self._update_status()
         if self._quitting and not self.update_worker:
             QApplication.quit()
@@ -789,7 +853,10 @@ class MainWindow(QMainWindow):
         if self.worker:
             self.worker.cancel.set()
             self.stop_button.setEnabled(False)
+            self.rental_panel.stop_button.setEnabled(False)
             self._log("已结束登录等待，普通浏览器可以继续手动使用。" if self.worker.mode == "login"
+                      else "已请求停止 GPU 型号和报价读取。" if self.worker.mode == "rental_probe"
+                      else "已请求停止候租；已接受的创建会继续核验，新实例保持运行。" if self.worker.mode.startswith("rental")
                       else "已请求停止；若本应用已开机，将先完成该实例的关机与核验。")
 
     def _resolve_pending(self):
@@ -814,6 +881,7 @@ class MainWindow(QMainWindow):
                     self.report = RunReport(**data)
                     break
         self.report = retain_snapshot(report, self.report)
+        self.rental_panel.set_instances(self.report.instances)
         self._render_report()
 
     def _render_report(self):
@@ -921,6 +989,8 @@ class MainWindow(QMainWindow):
             self.store.write("scheduler.json", {"last_attempt": now().isoformat()})
 
     def _failed(self, message):
+        if self.worker and self.worker.mode.startswith("rental"):
+            self.rental_panel.status.setText(message)
         self._log(f"需要处理：{message}")
         self.tray.showMessage("AutoDL Fresh 需要处理", message[:240], QSystemTrayIcon.MessageIcon.Warning, 15000)
 
@@ -1016,10 +1086,17 @@ class MainWindow(QMainWindow):
 
     def _update_status(self):
         pending = self.store.pending()
+        from .rental import PENDING_PHASES
+        rental = self.store.read("rental-task.json", {})
+        rental_pending = rental.get("phase") in PENDING_PHASES
+        self.rental_pending_button.setVisible(rental_pending)
         self.resolve_button.setVisible(bool(pending))
         if pending:
             self.hero_title.setText("有一个实例需要优先核验")
             self.hero_sub.setText(f"{pending['uuid']} · 点击“检查并刷新”继续核验。请勿重复手动开机。")
+        elif rental_pending:
+            self.hero_title.setText("有一次 GPU 候租创建需要核验")
+            self.hero_sub.setText("点击“查看候租”核验新实例或查看创建记录，核验前暂停新的租用与保活刷新。")
         elif self.auth_valid:
             self.hero_title.setText("登录态已保存，可以开始检查")
             self.hero_sub.setText("只读检查可预览全部实例；启用每日计划后将按设定时间自动处理。")
@@ -1032,13 +1109,16 @@ class MainWindow(QMainWindow):
         self._snapshot_hint()
 
     def _tick(self):
-        if self.worker or self._quitting or not self.auth_valid:
+        if self._quitting or not self.auth_valid or self._directory_switch_pending:
             return
         state = self.store.read("scheduler.json", {})
+        if self.worker:
+            return
         if schedule_due(self.settings, state.get("last_attempt", ""), now()):
             # Record attempt before dispatch to avoid an error/relogin loop every 15 seconds.
             self.store.write("scheduler.json", {"last_attempt": now().isoformat()})
             self._start("refresh", scheduled=True)
+            return
 
     def _quit(self):
         self._quitting = True
@@ -1048,7 +1128,7 @@ class MainWindow(QMainWindow):
         if self.worker:
             self._cancel()
             self._show()
-            self._log("正在安全结束任务，完成当前实例核验后退出。")
+            self._log("正在安全结束任务，完成已提交操作的核验后退出。")
         elif self.update_worker:
             self._log("正在结束更新任务，完成下载清理后退出。")
         else:

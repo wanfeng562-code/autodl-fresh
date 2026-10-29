@@ -9,6 +9,8 @@ import shutil
 DATA_FILES = (
     "settings.json", "auth.json", "pending.json", "scheduler.json", "history.json",
     "manual_resolutions.json", "recovery_events.json", "activity.log", "activity.previous.log",
+    "rental-options.json", "rental-task.json", "rental-history.json",
+    "gpu-quotes.json",
 )
 
 

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autodl-fresh"
-version = "0.6.0"
-description = "AutoDL 容器实例保活桌面助手"
+version = "0.7.5"
+description = "AutoDL 实例保活与 GPU 候租桌面助手"
 authors = [{name = "wanfeng562-code"}]
 license = "LicenseRef-AutoDLFresh-NonCommercial-1.0"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "licenses/third-party/**/*"]
@@ -20,6 +20,9 @@ autodl-fresh = "autodl_fresh.app:main"
 
 [tool.setuptools.packages.find]
 include = ["autodl_fresh*"]
+
+[tool.setuptools.package-data]
+autodl_fresh = ["data/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

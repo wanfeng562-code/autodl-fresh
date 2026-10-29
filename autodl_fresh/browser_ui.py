@@ -5,7 +5,7 @@ import time
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from .platform_support import activate_browser_window
+from .platform_support import activate_browser_window, background_browser_windows
 
 # Edge's command line treats about:blank with a fragment as an unknown start URL
 # and substitutes its online new-tab page. Keep the initial URL plain.
@@ -14,8 +14,27 @@ WORK_PREFIX = "about:blank#autodl-fresh-work-"
 NOTICE_ID = "autodl-fresh-login-saved"
 
 
+def background_work_window(browser, page, *, hidden=False):
+    client = browser.new_browser_cdp_session()
+    session = page.context.new_cdp_session(page)
+    try:
+        target_id = session.send("Target.getTargetInfo")["targetInfo"]["targetId"]
+        window = client.send("Browser.getWindowForTarget", {"targetId": target_id})
+        client.send("Browser.setWindowBounds", {"windowId": window["windowId"],
+                                                "bounds": {"windowState": "minimized"}})
+        processes = client.send("SystemInfo.getProcessInfo")["processInfo"]
+        process_id = next(int(p["id"]) for p in processes if p["type"] == "browser")
+        if hidden and not background_browser_windows(process_id, hidden=True):
+            raise RuntimeError("未能隐藏后台核价专用窗口，本次核价已停止")
+        if not hidden:
+            background_browser_windows(process_id)
+    finally:
+        session.detach()
+        client.detach()
+
+
 def is_empty_page(page) -> bool:
-    return page.url in {"about:blank", "edge://newtab/", "chrome://newtab/", STARTUP_URL}
+    return page.url in {"about:blank", "edge://newtab/", "chrome://newtab/", STARTUP_URL} or page.url.startswith(WORK_PREFIX)
 
 
 def close_empty_pages(context, original_empty, *, protected=None):
@@ -23,21 +42,28 @@ def close_empty_pages(context, original_empty, *, protected=None):
     for page in list(context.pages):
         if page is protected or page.is_closed():
             continue
-        if (page in original_empty or page.url == STARTUP_URL) and is_empty_page(page):
+        if (page in original_empty or page.url == STARTUP_URL or page.url.startswith(WORK_PREFIX)) and is_empty_page(page):
             try:
                 page.close()
             except Exception:
                 pass
 
 
-def create_work_page(browser, context, *, foreground=False, focus_warning=None):
+def create_work_page(browser, context, *, foreground=False, focus_warning=None, startup_page=None):
     """Unlike new_page(), CDP can create a tab without activating it."""
     client = browser.new_browser_cdp_session()
     marker = WORK_PREFIX + uuid4().hex
     target = None
     try:
-        with context.expect_page():
-            target = client.send("Target.createTarget", {"url": marker, "background": not foreground})
+        if startup_page is not None and not startup_page.is_closed() and is_empty_page(startup_page):
+            session = context.new_cdp_session(startup_page)
+            try:
+                target = {"targetId": session.send("Target.getTargetInfo")["targetInfo"]["targetId"]}
+            finally:
+                session.detach()
+        else:
+            with context.expect_page():
+                target = client.send("Target.createTarget", {"url": marker, "background": not foreground})
         deadline = time.monotonic() + 8
         while time.monotonic() < deadline:
             for candidate in context.pages:

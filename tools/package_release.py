@@ -24,7 +24,8 @@ def main():
     shutil.copytree(ROOT / "licenses", app / "licenses", dirs_exist_ok=True)
     shutil.copytree(ROOT / "docs", app / "docs", dirs_exist_ok=True)
     files = [file for file in app.rglob("*") if file.is_file()]
-    private_names = {"auth.json", "settings.json", "pending.json", "scheduler.json", "history.json", "Preferences", "app.lock"}
+    private_names = {"auth.json", "settings.json", "pending.json", "scheduler.json", "history.json",
+                     "rental-options.json", "rental-task.json", "rental-history.json", "gpu-quotes.json", "Preferences", "app.lock"}
     if any(file.name in private_names or file.name.endswith(".log") or file.is_symlink() for file in files):
         raise SystemExit("Unexpected runtime/private data found in the release folder.")
     releases = ROOT / "releases"

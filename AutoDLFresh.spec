@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_all
 from pathlib import Path
 import sys
 
-datas = []
+datas = [('autodl_fresh/data/gpu_quotes.json', 'autodl_fresh/data')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('playwright')

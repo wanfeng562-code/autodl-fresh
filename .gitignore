@@ -19,6 +19,10 @@ settings.json
 pending.json
 scheduler.json
 history.json
+rental-options.json
+rental-task.json
+rental-history.json
+gpu-quotes.json
 activity*.log
 browser-profile-*/
 browser-autodl-only-*/

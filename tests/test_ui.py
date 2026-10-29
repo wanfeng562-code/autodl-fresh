@@ -9,7 +9,7 @@ def test_ui_settings_report_and_search(tmp_path):
     app = QApplication.instance() or QApplication([])
     window = MainWindow(Store(tmp_path))
     window.timer.stop()
-    assert window.stack.count() == 4
+    assert window.stack.count() == 5
     assert not window.settings.schedule_enabled
     report = RunReport(instances=[
         Instance(uuid="abcdefgh-12345678", name="训练环境", status="已关机", charge="按量计费", remaining_seconds=2*DAY),

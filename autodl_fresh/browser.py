@@ -11,7 +11,7 @@ from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sy
 from .models import DAY, Instance, compact, parse_countdown
 from .storage import Settings, Store
 from .native_browser import NativeBrowser, import_saved_state
-from .browser_ui import close_empty_pages, create_work_page, is_empty_page
+from .browser_ui import background_work_window, close_empty_pages, create_work_page, is_empty_page
 
 
 class ConsoleError(RuntimeError):
@@ -34,12 +34,19 @@ class Cancelled(ConsoleError):
     pass
 
 
+class InventoryUnavailable(ConsoleError):
+    """A temporary table read failed before any order was submitted."""
+
+
 @contextmanager
-def browser_session(settings: Settings, store: Store, *, login: bool = False, native=None):
+def browser_session(settings: Settings, store: Store, *, login: bool = False, native=None, window_mode=None):
     settings.validate()
+    window_mode = "foreground" if login else window_mode or (
+        "foreground" if settings.browser_visibility == "foreground" else "minimized")
     with sync_playwright() as playwright:
         if settings.browser_mode == "native":
-            native = native or NativeBrowser(settings, store)
+            native = native or NativeBrowser(settings, store, window_mode=window_mode)
+            newly_started = native.endpoint() is None
             endpoint = native.ensure_open(login=login, chromium_path=playwright.chromium.executable_path)
             browser = playwright.chromium.connect_over_cdp(endpoint, no_defaults=True)
             context = browser.contexts[0]
@@ -47,25 +54,32 @@ def browser_session(settings: Settings, store: Store, *, login: bool = False, na
             context.set_default_navigation_timeout(30000)
             original_empty = [page for page in context.pages if is_empty_page(page)]
             focus_messages = []
-            page = create_work_page(browser, context,
-                                    foreground=not login and settings.browser_visibility == "foreground",
-                                    focus_warning=focus_messages.append)
-            work_session = context.new_cdp_session(page)
+            startup = original_empty[0] if newly_started and not login and original_empty else None
+            page = None
             try:
+                page = create_work_page(browser, context,
+                                        foreground=not login and settings.browser_visibility == "foreground",
+                                        focus_warning=focus_messages.append, startup_page=startup)
+                work_session = context.new_cdp_session(page)
                 # Keep requestAnimationFrame/actionability checks working in a
                 # background or minimized tab. Apply it only to our work page;
                 # the user's visible tabs retain their normal focus state.
                 work_session.send("Emulation.setFocusEmulationEnabled", {"enabled": True})
+                if not login and window_mode != "foreground":
+                    background_work_window(browser, page, hidden=window_mode == "hidden")
                 if not login and store.auth_path.exists():
                     import_saved_state(page, context, store)
                 console = AutoDLConsole(page, settings)
                 console.browser_warnings = focus_messages
+                # Remove spare startup tabs as soon as a work tab exists, rather
+                # than leaving a visible blank tab for the duration of the job.
+                close_empty_pages(context, original_empty, protected=page)
                 yield console, context
             finally:
                 close_empty_pages(context, original_empty, protected=page)
                 # Leave the user's ordinary browser/profile intact. Stopping the
                 # Playwright driver disconnects CDP; only our temporary tab closes.
-                if not page.is_closed():
+                if page is not None and not page.is_closed():
                     try:
                         page.close()
                     except Exception:
@@ -74,8 +88,9 @@ def browser_session(settings: Settings, store: Store, *, login: bool = False, na
         channel = None if settings.browser_channel == "chromium" else settings.browser_channel
         try:
             browser = playwright.chromium.launch(
-                channel=channel, headless=False if login else settings.browser_visibility == "background",
-                args=["--disable-extensions", "--disable-sync", "--disable-features=msImplicitSignin"],
+                channel=channel, headless=window_mode == "hidden",
+                args=["--disable-extensions", "--disable-sync", "--disable-features=msImplicitSignin",
+                      *(["--start-minimized"] if window_mode == "minimized" else [])],
             )
         except Exception as exc:
             raise ConsoleError("浏览器无法启动。请安装所选 Edge / Chrome，或选择 Chromium 并先安装浏览器组件。") from exc
@@ -88,6 +103,10 @@ def browser_session(settings: Settings, store: Store, *, login: bool = False, na
             context.set_default_timeout(12000)
             context.set_default_navigation_timeout(30000)
             page = context.new_page()
+            session = context.new_cdp_session(page)
+            session.send("Emulation.setFocusEmulationEnabled", {"enabled": True})
+            if window_mode == "minimized":
+                background_work_window(browser, page)
             # Native JS confirm dialogs are NOT used by the supported AutoDL UI.
             # Never silently accept an unfamiliar dialog.
             page.on("dialog", lambda dialog: dialog.dismiss())
@@ -153,17 +172,24 @@ class AutoDLConsole:
         raise LayoutChanged("未找到实例表格。请确认已登录普通“容器实例”，并在网页列设置中显示状态、付费方式、释放时间及操作列。")
 
     def _wait_loading(self):
-        self.page.locator(self.TABLE).locator(".el-loading-mask:visible").wait_for(state="hidden", timeout=30000)
+        masks = self.page.locator(self.TABLE).locator(".el-loading-mask:visible")
+        deadline = time.monotonic() + 30
+        while masks.count():
+            if time.monotonic() >= deadline:
+                raise LayoutChanged("实例列表仍在加载，请检查网络后重试")
+            self.page.wait_for_timeout(100)
 
     def _headers(self) -> dict[str, int]:
         headers = self.page.locator(self.TABLE).locator(".el-table__header-wrapper th").all_inner_texts()
         result = {}
         for index, header in enumerate(headers):
             label = compact(header)
+            if label.startswith("规格详情"):
+                result["spec"] = index
             for key, pattern in {"id": "实例ID", "status": "状态", "release": "释放时间", "charge": "付费方式", "action": "操作"}.items():
                 if label.startswith(pattern):
                     result[key] = index
-        if set(result) != {"id", "status", "release", "charge", "action"}:
+        if not {"id", "status", "release", "charge", "action"}.issubset(result):
             raise LayoutChanged("实例表格缺少必要列。请在 AutoDL 网页的列设置中显示：实例ID、状态、付费方式、释放时间、操作。")
         return result
 
@@ -193,12 +219,14 @@ class AutoDLConsole:
             elif any(word in status_text for word in ("异常", "失败", "宕机", "错误", "维护", "重置", "迁移")):
                 blocked = "实例异常或维护中，需人工处理"
             retention = re.search(r"关机(\d+)天后释放", compact(release_text))
+            spec = re.search(r"(.+?)\s*\*\s*(\d+)\s*卡", cells[headers["spec"]], re.S) if "spec" in headers else None
             instance = Instance(
                 uuid=uuid, name=after, region=lines[0] if lines else "",
                 status=status, release_text=release_text,
                 remaining_seconds=parse_countdown(release_text), no_gpu="无卡模式" in status_text,
                 charge=compact(cells[headers["charge"]]).split("余额")[0], page=page_number,
                 blocked_reason=blocked, retention_days=int(retention[1]) if retention else 15,
+                gpu_name=spec[1].strip() if spec else "", gpu_count=int(spec[2]) if spec else 0,
             )
             result.append(instance)
             self.locations[uuid] = page_number

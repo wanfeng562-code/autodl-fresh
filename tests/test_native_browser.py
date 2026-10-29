@@ -21,6 +21,9 @@ def test_normal_browser_arguments_use_app_only_profile(tmp_path):
     assert "--disable-sync" in args
     assert "--disable-features=msImplicitSignin" in args
     assert not any("enable-automation" in arg or "headless" in arg or "AutomationControlled" in arg for arg in args)
+    assert "--start-minimized" not in args
+    background_args = browser_args(Path("msedge.exe"), profile, "about:blank", 38456, background=True)
+    assert "--start-minimized" in background_args
 
 
 def test_privacy_profile_blocks_browser_identity_and_personal_autofill(tmp_path):
@@ -97,7 +100,16 @@ def test_native_browser_can_reconnect_and_preserve_its_own_profile(tmp_path):
         def log_message(self, *args):
             pass
 
-    server = HTTPServer(("127.0.0.1", 0), Handler)
+    # Some Windows hosts allocate port 0 from a low range containing Chromium's
+    # blocked service ports (e.g. 2049). Bind and retain a safe fixture port.
+    for port in range(20000, 20100):
+        try:
+            server = HTTPServer(("127.0.0.1", port), Handler)
+            break
+        except OSError:
+            continue
+    else:
+        pytest.fail("No free local fixture port in 20000–20099")
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     origin = f"http://127.0.0.1:{server.server_port}"
