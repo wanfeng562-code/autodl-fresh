@@ -39,7 +39,8 @@ class InventoryUnavailable(ConsoleError):
 
 
 @contextmanager
-def browser_session(settings: Settings, store: Store, *, login: bool = False, native=None, window_mode=None):
+def browser_session(settings: Settings, store: Store, *, login: bool = False, native=None, window_mode=None,
+                    close_browser_on_exit=False):
     settings.validate()
     window_mode = "foreground" if login else window_mode or (
         "foreground" if settings.browser_visibility == "foreground" else "minimized")
@@ -76,14 +77,19 @@ def browser_session(settings: Settings, store: Store, *, login: bool = False, na
                 close_empty_pages(context, original_empty, protected=page)
                 yield console, context
             finally:
-                close_empty_pages(context, original_empty, protected=page)
-                # Leave the user's ordinary browser/profile intact. Stopping the
-                # Playwright driver disconnects CDP; only our temporary tab closes.
-                if page is not None and not page.is_closed():
+                if close_browser_on_exit:
                     try:
-                        page.close()
+                        browser.new_browser_cdp_session().send("Browser.close")
                     except Exception:
-                        pass  # The user may close the ordinary browser themselves.
+                        pass  # Already closed by the user or browser itself.
+                else:
+                    close_empty_pages(context, original_empty, protected=page)
+                    # Non-rental jobs leave other dedicated-browser tabs intact.
+                    if page is not None and not page.is_closed():
+                        try:
+                            page.close()
+                        except Exception:
+                            pass  # The user may close the ordinary browser themselves.
             return
         channel = None if settings.browser_channel == "chromium" else settings.browser_channel
         try:

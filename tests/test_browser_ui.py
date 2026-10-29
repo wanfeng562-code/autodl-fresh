@@ -2,6 +2,9 @@ import time
 import ctypes
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
+from contextlib import nullcontext
+
+import pytest
 
 from playwright.sync_api import sync_playwright
 
@@ -243,3 +246,23 @@ def test_hidden_quote_window_has_no_visible_taskbar_window_and_uses_separate_pro
             assert foreground_process() == previous_foreground
     finally:
         close_native(hidden)
+
+
+@pytest.mark.parametrize('failure', [False, True])
+def test_rental_session_ends_its_dedicated_browser_process_and_preserves_exceptions(tmp_path, failure):
+    settings, store = Settings(), Store(tmp_path)
+    native = NativeBrowser(settings, store)
+    try:
+        with pytest.raises(RuntimeError, match='fixture failure') if failure else nullcontext():
+            with browser_session(settings, store, native=native, close_browser_on_exit=True) as (console, context):
+                context.new_page().set_content('<title>Another dedicated test tab</title>')
+                assert native.endpoint()
+                if failure:
+                    raise RuntimeError('fixture failure')
+        deadline = time.monotonic() + 5
+        while native.endpoint() and time.monotonic() < deadline:
+            time.sleep(.05)
+        assert native.endpoint() is None
+        native.process.wait(timeout=5)
+    finally:
+        close_native(native)

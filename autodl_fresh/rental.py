@@ -103,9 +103,9 @@ class RentalEngine:
     def _verify(self):
         target = self.adapter.verify(self.task)
         self._save(phase="completed", target_uuid=target.uuid,
-                   message=f"租用成功：{target.uuid}，GPU 已开机，系统盘克隆及数据盘拷贝已完成。")
+                   message=f"克隆完成：{target.uuid}，系统盘克隆及数据盘拷贝已完成。")
         self._archive()
-        self.log(self.task["message"] + " 新实例保持运行，请使用后自行关机。")
+        self.log(self.task["message"] + " 本次候租已结束，请使用后自行关机。")
         return dict(self.task)
 
     def run(self, *, recover=False):
@@ -198,7 +198,7 @@ class RentalEngine:
                         self.log(self.task["message"])
                         break
                     self._save(phase="accepted", target_uuid=target_uuid,
-                               message=f"平台已接受创建：{target_uuid}，正在核验运行状态与数据盘拷贝")
+                               message=f"克隆实例已创建：{target_uuid}，正在等待克隆完成")
                     # Once a request was accepted, stopping does not abandon its
                     # verification, and must never turn off a GPU rented for use.
                     return self._verify()

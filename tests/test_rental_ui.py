@@ -146,11 +146,12 @@ def test_rental_success_uses_persistent_banner_sound_and_taskbar_once(tmp_path, 
     monkeypatch.setattr(QApplication, 'beep', lambda: sounds.append(True))
     monkeypatch.setattr(QApplication, 'alert', lambda *args: alerts.append(args))
     monkeypatch.setattr(window.tray, 'showMessage', lambda *args: notifications.append(args))
-    task = {'phase':'gpu_running', 'target_uuid':'targetaa-12345678', 'message':'GPU 已运行，数据盘拷贝中'}
+    task = {'phase':'accepted', 'target_uuid':'targetaa-12345678', 'message':'克隆实例已创建，正在等待完成'}
     try:
         window._rental_updated(task)
         assert not window.rental_success_banner.isHidden()
         assert task['target_uuid'] in window.rental_success_text.text()
+        assert '正在等待完成' in window.rental_success_text.text()
         assert len(sounds) == len(alerts) == len(notifications) == 1
         window._rental_updated({**task, 'phase':'completed', 'message':'GPU 与数据盘已就绪'})
         assert '数据盘已就绪' in window.rental_success_text.text()
@@ -239,3 +240,40 @@ def test_missing_quotes_require_explicit_recheck_click(tmp_path):
 def test_removed_automatic_quote_job_cannot_be_dispatched(tmp_path):
     with pytest.raises(ValueError, match='不支持'):
         BrowserWorker(Settings(), Store(tmp_path), 'rental_quotes')
+
+
+def test_api_only_recovery_preserves_auth_and_requests_browser_cleanup(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from autodl_fresh import worker as worker_module, rental_browser
+    app = QApplication.instance() or QApplication([])
+    store = Store(tmp_path)
+    auth = {'cookies':[], 'origins':[{'origin':'https://www.autodl.com',
+                                    'localStorage':[{'name':'token','value':'fixture-only'}]}]}
+    store.write('auth.json', auth)
+    store.write('rental-task.json', {'phase':'accepted','target_uuid':'targetaa-12345678',
+                                   'options':{'source_uuid':source().uuid,'gpu_names':['RTX 4090']}})
+    events = []
+    @contextmanager
+    def session(*args, **kwargs):
+        assert kwargs['close_browser_on_exit'] is True
+        yield SimpleNamespace(), SimpleNamespace(storage_state=lambda **kw: (_ for _ in ()).throw(
+            AssertionError('API-only recovery must preserve the saved website state')))
+        events.append('browser_closed')
+    class Adapter:
+        def __init__(self, console, *, auth_state):
+            assert auth_state == auth
+        def show_status(self, task):
+            pass
+        def verify(self, task):
+            events.append('clone_completed')
+            return Instance(task['target_uuid'])
+    monkeypatch.setattr(worker_module, 'browser_session', session)
+    monkeypatch.setattr(rental_browser, 'CloneConsole', Adapter)
+    errors = []
+    worker = BrowserWorker(Settings(), store, 'rental_verify')
+    worker.failed.connect(errors.append)
+    worker.run()
+    assert not errors and events == ['clone_completed','browser_closed']
+    assert store.read('auth.json') == auth
+    app.processEvents()

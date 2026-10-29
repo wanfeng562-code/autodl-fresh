@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from html import escape
+import json
 import re
 import time
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 from playwright.sync_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
 
 from .browser import ActionRejected, Cancelled, ConsoleError, InventoryUnavailable, LayoutChanged, SessionExpired
-from .models import compact
+from .models import Instance, compact
 from .rental import GPUOffer, RentalOptions, StockLost, money
 
 
@@ -22,14 +24,25 @@ class CloneConsole:
     RESPONSE_TIMEOUT = 25000
     MACHINE_PATH = "/api/v1/user/machine/list"
 
-    def __init__(self, console):
+    def __init__(self, console, *, auth_state=None, request_client=None):
         self.console, self.page = console, console.page
         self.source = None
         self.url = ""
         self.region_sign = ""
         self.region_value = ""
         self.expand_bytes = 0
-        self.statuses = {}
+        self.request_client = request_client or self.page.context.request
+        self.authorization = ""
+        for origin in (auth_state or {}).get("origins", []):
+            if origin.get("origin") == urlunsplit((*urlsplit(console.settings.console_url)[:2], "", "", "")):
+                token = next((v["value"] for v in origin.get("localStorage", []) if v["name"] == "token"), "")
+                try:
+                    parsed = json.loads(token)
+                    token = parsed if isinstance(parsed, str) else parsed.get("token", token)
+                except (ValueError, TypeError, AttributeError):
+                    pass
+                if isinstance(token, str):
+                    self.authorization = token
         self.price_key = None
         self.price_hourly = None
         self.price_disk_daily = None
@@ -39,14 +52,12 @@ class CloneConsole:
         self.machine_sequence = 0
         self.machine_success = 0
         self.machine_auth_failed = False
-        self.on_running = lambda task: None
         self.cancel = None
         self.page_crashed = False
         self.page.on("crash", lambda *_: setattr(self, "page_crashed", True))
         self.sorted_idle_floor = None
         self.order_attempt = None
         self.order_guard_installed = False
-        self.page.on("response", self._observe_instances)
         self.page.on("response", self._observe_quote)
         self.page.on("request", self._machine_request)
         self.page.on("requestfinished", lambda r: self.machine_pending.discard(r))
@@ -59,6 +70,10 @@ class CloneConsole:
                 "browser_connected": bool(browser and browser.is_connected())}
 
     def _machine_request(self, request):
+        if urlsplit(request.url).netloc == urlsplit(self.console.settings.console_url).netloc:
+            token = request.headers.get("authorization")
+            if token:
+                self.authorization = token
         if urlsplit(request.url).path == self.MACHINE_PATH:
             self.machine_pending.add(request)
             self.machine_latest = request
@@ -150,22 +165,6 @@ class CloneConsole:
                                   int(data.get("expand_data_disk", 0)), data["charge_type"])
         except (ValueError, TypeError, KeyError, AttributeError, PlaywrightError):
             self.price_key = None
-
-    def _observe_instances(self, response):
-        if urlsplit(response.url).path != "/api/v1/instance" or response.status != 200:
-            return
-        try:
-            payload = response.json()
-            if payload.get("code") != "Success":
-                return
-            for item in payload.get("data", {}).get("list", []):
-                # Do not persist the raw account response (contains SSH secrets).
-                self.statuses[item["uuid"]] = {
-                    "copy": (item.get("additional_info") or {}).get("copy_data_disk_after_clone_status"),
-                    "clone": item.get("clone_status"),
-                }
-        except (ValueError, TypeError, KeyError, AttributeError, PlaywrightError):
-            pass
 
     def prepare(self, uuid):
         try:
@@ -637,26 +636,68 @@ class CloneConsole:
 
     def verify(self, task):
         uuid = task["target_uuid"]
-        options = RentalOptions.from_dict(task["options"])
+        if not isinstance(uuid, str) or not self.console.ID_RE.fullmatch(uuid):
+            raise ConsoleError("新实例 ID 无法识别，请先在网页核对")
+        # Tear down the website's redirect/poll timers once the order is known.
+        # Waiting never visits or scans the instance-list UI.
+        self.page.goto("about:blank#autodl-fresh-clone-wait", wait_until="domcontentloaded")
+        self.page.set_content("""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+            <title>AutoDL Fresh · 等待克隆完成</title>
+            <style>body{margin:0;background:#f4f7f6;color:#243b33;font:18px 'Microsoft YaHei UI',sans-serif}
+            main{max-width:720px;margin:15vh auto;padding:36px;background:white;border:1px solid #d7e2dc;
+            border-radius:12px}h1{font-size:26px}p{line-height:1.8}code{color:#23855d}</style>
+            <main><h1>克隆实例已创建</h1><p>新实例：<code>""" + escape(uuid) + """</code></p>
+            <p id="clone-progress">正在等待系统盘克隆和数据盘拷贝完成…</p>
+            <p>完成后将自动关闭本次专用浏览器。</p></main></html>""")
         deadline = time.monotonic() + self.console.settings.timeout_seconds
-        announced = False
         while time.monotonic() < deadline:
-            self.statuses.pop(uuid, None)
-            items = self.console.scan()
-            item = next((x for x in items if x.uuid == uuid), None)
-            status = self.statuses.get(uuid, {})
-            if item:
-                if (compact(item.region.split("/")[0]) != compact(task["source_region"])
-                        or item.gpu_name != task["offer"]["gpu_name"] or item.gpu_count != options.gpu_count):
-                    raise ConsoleError("新实例地区、GPU 型号或卡数与订单不匹配，请在网页核对")
-                if item.blocked_reason or status.get("copy") in {"Failed", "Error"}:
-                    raise ConsoleError("新实例克隆或数据盘拷贝异常，请在网页处理")
-                if item.status == "运行中" and not item.no_gpu:
-                    if not announced:
-                        self.on_running({**task, "phase": "gpu_running",
-                                         "message": f"GPU 已租到并运行：{uuid}，正在核验数据盘拷贝。"})
-                        announced = True
-                    if status.get("copy") == "Success":
-                        return item
+            try:
+                state = self._target_state(uuid)
+            except InventoryUnavailable:
+                state = None
+            if state:
+                clone, copy, status = state["clone"].casefold(), state["copy"].casefold(), state["status"].casefold()
+                if clone in {"failed", "error"} or copy in {"failed", "error"} or status in {"create_failed", "removing", "removed"}:
+                    raise ConsoleError("新实例克隆或数据盘拷贝失败，请在网页处理；已保留新实例 ID，不会重复下单")
+                if clone in {"", "success", "succeed", "succeeded"} and copy in {"success", "succeed", "succeeded"}:
+                    return Instance(uuid)
             self.page.wait_for_timeout(self.console.settings.poll_seconds * 1000)
-        raise ConsoleError(f"等待 {uuid} 运行及数据盘拷贝完成超时；请点击“核验已创建实例”，不会重新下单")
+        raise ConsoleError(f"等待 {uuid} 克隆完成超时；请点击“核验已创建实例”，只查询这一台，不会重新下单")
+
+    def _target_state(self, uuid):
+        base = urlsplit(self.console.settings.console_url)
+        url = urlunsplit((base.scheme, base.netloc, "/api/v1/instance", "", ""))
+        headers = {"Authorization": self.authorization} if self.authorization else {}
+        try:
+            response = self.request_client.post(url, data={"name": uuid, "page_index": 1, "page_size": 1},
+                                                headers=headers, max_redirects=0, timeout=10000)
+        except PlaywrightError as exc:
+            if self.page.is_closed() or not self.page.context.browser.is_connected():
+                raise
+            raise InventoryUnavailable("新实例状态暂时无法读取，将继续等待") from exc
+        try:
+            if response.status in {401, 403}:
+                raise SessionExpired("登录已过期，请重新登录后继续核验新实例")
+            payload = response.json()
+            if isinstance(payload, dict) and payload.get("code") == "AuthorizeFailed":
+                raise SessionExpired("登录已过期，请重新登录后继续核验新实例")
+            if response.status != 200 or not isinstance(payload, dict) or payload.get("code") != "Success":
+                raise InventoryUnavailable("新实例状态请求暂未成功，将继续等待")
+            rows = (payload.get("data") or {}).get("list", [])
+            if not rows:
+                return None
+            if len(rows) != 1 or rows[0].get("uuid") != uuid:
+                raise ConsoleError("按 ID 查询的新实例结果不匹配，请在网页核对；不会遍历其他实例")
+            row = rows[0]
+            additional = row.get("additional_info") or {}
+            # Account list responses contain SSH secrets. Retain only these
+            # three progress fields; never log or persist the response body.
+            return {"clone": str(row.get("clone_status") or ""), "status": str(row.get("status") or ""),
+                    "copy": str(additional.get("copy_data_disk_after_clone_status") or "")}
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise InventoryUnavailable("新实例状态格式暂不可读，将继续等待") from exc
+        finally:
+            try:
+                response.dispose()
+            except PlaywrightError:
+                pass

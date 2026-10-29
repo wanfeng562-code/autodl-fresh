@@ -805,14 +805,15 @@ class MainWindow(QMainWindow):
         self._update_status()
         uuid = task.get("target_uuid", "")
         if task.get("phase") == "completed" and uuid:
-            self.rental_success_text.setText("GPU 已运行，数据盘已就绪 · " + uuid)
-        if task.get("phase") in {"gpu_running", "completed"} and uuid and uuid not in self._notified_rentals:
+            self.rental_success_text.setText("克隆已完成，数据盘已就绪 · " + uuid)
+        if task.get("phase") in {"accepted", "gpu_running", "completed"} and uuid and uuid not in self._notified_rentals:
             self._notified_rentals.add(uuid)
             self.rental_completed_uuid = uuid
-            if task["phase"] == "gpu_running":
-                self.rental_success_text.setText("GPU 已租到并开机，正在核验数据盘 · " + uuid)
+            if task["phase"] != "completed":
+                self.rental_success_text.setText("克隆实例已创建，正在等待完成 · " + uuid)
             self.rental_success_banner.show()
-            self.tray.showMessage("GPU 已租到并开机", task["message"][:240], QSystemTrayIcon.MessageIcon.Information, 15000)
+            self.tray.showMessage("克隆已完成" if task["phase"] == "completed" else "克隆实例已创建",
+                                  task["message"][:240], QSystemTrayIcon.MessageIcon.Information, 15000)
             QApplication.beep()
             QApplication.alert(self, 10000)
 
@@ -856,7 +857,7 @@ class MainWindow(QMainWindow):
             self.rental_panel.stop_button.setEnabled(False)
             self._log("已结束登录等待，普通浏览器可以继续手动使用。" if self.worker.mode == "login"
                       else "已请求停止 GPU 型号和报价读取。" if self.worker.mode == "rental_probe"
-                      else "已请求停止候租；已接受的创建会继续核验，新实例保持运行。" if self.worker.mode.startswith("rental")
+                      else "已请求停止候租；已创建的实例会继续等待克隆完成，随后关闭专用浏览器。" if self.worker.mode.startswith("rental")
                       else "已请求停止；若本应用已开机，将先完成该实例的关机与核验。")
 
     def _resolve_pending(self):

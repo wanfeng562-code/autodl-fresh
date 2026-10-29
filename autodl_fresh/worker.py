@@ -43,14 +43,15 @@ class BrowserWorker(QThread):
             if self.mode == "login" and self.settings.browser_mode == "native":
                 self._native_login()
                 return
-            with browser_session(self.settings, self.store, login=self.mode == "login") as (console, context):
+            with browser_session(self.settings, self.store, login=self.mode == "login",
+                                 close_browser_on_exit=self.mode in {"rental", "rental_verify"}) as (console, context):
                 console.log = self.log.emit
                 for message in getattr(console, "browser_warnings", []):
                     self.log.emit(message)
                 if self.mode.startswith("rental"):
                     from .rental_browser import CloneConsole
                     from .rental import RentalEngine
-                    adapter = CloneConsole(console)
+                    adapter = CloneConsole(console, auth_state=self.store.read("auth.json", {}))
                     adapter.cancel = self.cancel
                     if self.mode == "rental_probe":
                         from .quote_cache import QuoteCache
@@ -75,7 +76,13 @@ class BrowserWorker(QThread):
                         def rental_changed(task):
                             adapter.show_status(task)
                             self.rental_updated.emit(deepcopy(task))
-                        adapter.on_running = rental_changed
+                            if task.get("phase") == "accepted":
+                                # Capture website state before replacing it with
+                                # the local wait page; notify before this I/O.
+                                try:
+                                    save_auth(context, self.store)
+                                except Exception:
+                                    self.log.emit("新实例已创建；登录态未能另存，现有登录文件保留。")
                         result = RentalEngine(
                             adapter, self.store, self.rental_options, log=self.log.emit,
                             changed=rental_changed, cancel=self.cancel,
@@ -84,7 +91,8 @@ class BrowserWorker(QThread):
                             if "登录" in result["message"]:
                                 self.auth_expired.emit()
                             self.failed.emit(result["message"])
-                    save_auth(context, self.store)
+                    if self.mode == "rental_probe" or (self.mode == "rental" and not result.get("target_uuid")):
+                        save_auth(context, self.store)
                     return
                 if self.mode == "login":
                     console.page.goto(self.settings.console_url, wait_until="domcontentloaded")
