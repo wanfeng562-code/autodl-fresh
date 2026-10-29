@@ -23,6 +23,10 @@ class CloneSite:
         self.target = False
         self.bad_body = False
         self.rejected = False
+        self.order_replies = []
+        self.hold_order = False
+        self.held_orders = []
+        self.creations = 0
         self.copy_status = "Success"
         self.price = "2.00"
         self.api_price = None
@@ -38,6 +42,8 @@ class CloneSite:
         self.market_failures = 0
         self.market_auth_failed = False
         self.page_views = 0
+        self.page_paths = []
+        self.order_page_views = []
         self.machines = [dict(id="m1", gpu="RTX 4090", idle=2, price="2.00"),
                          dict(id="m2", gpu="RTX 3090", idle=1, price="1.00")]
 
@@ -46,9 +52,11 @@ class CloneSite:
         path = urlsplit(request.url).path
         if path == "/console/instance/list":
             self.page_views += 1
+            self.page_paths.append(path)
             route.fulfill(content_type="text/html; charset=utf-8", body=self.instances())
         elif path == "/cloneInstance":
             self.page_views += 1
+            self.page_paths.append(path)
             route.fulfill(content_type="text/html; charset=utf-8", body=self.clone())
         elif path == "/api/v1/instance":
             route.fulfill(json={"code": "Success", "data": {"list": [
@@ -57,10 +65,17 @@ class CloneSite:
             ]}})
         elif path == CloneConsole.ORDER_PATH:
             self.orders.append(request.post_data_json)
-            if self.rejected:
-                route.fulfill(json={"code": "NoStock"})
+            self.order_page_views.append(self.page_views)
+            if self.hold_order:
+                self.held_orders.append(route)
+            elif self.order_replies:
+                status, payload = self.order_replies.pop(0)
+                route.fulfill(status=status, json=payload)
+            elif self.rejected:
+                route.fulfill(json={"code": "TORecharge", "msg": "余额不足"})
             else:
                 self.target = True
+                self.creations += 1
                 route.fulfill(json={"code": "Success", "data": TARGET})
         elif path == "/api/v1/order/price/preview":
             route.fulfill(json={"code": "Success", "data": {
@@ -309,7 +324,7 @@ def test_delayed_website_preflight_cannot_create_after_timeout(site_adapter):
     adapter.prepare(SOURCE)
     offer = adapter.offers(config(), threading.Event())[0]
     assert adapter.select(offer, config())
-    adapter.page.evaluate("window.originalCreate = create; window.create = () => setTimeout(originalCreate, 700)")
+    adapter.page.evaluate("window.originalCreate = create; window.create = () => setTimeout(originalCreate, 700); void 0")
     adapter.RESPONSE_TIMEOUT = 200
     with pytest.raises(ActionRejected):
         adapter.create(offer, config(), lambda: None)
@@ -347,6 +362,94 @@ def test_dom_explicit_platform_rejection_is_not_success(site_adapter, tmp_path):
     site.rejected = True
     task = RentalEngine(adapter, Store(tmp_path), config()).run()
     assert task["phase"] == "failed" and len(site.orders) == 1
+
+
+@pytest.mark.parametrize('payload', [
+    {'code':'MachineGpuNumUpdateFailed','msg':'该主机空闲GPU数量不足，请更换主机。'},
+    {'code':'NoStock'},
+    {'code':'Failed','msg':'该主机空闲 GPU 数量不足，请更换主机。'},
+])
+def test_lost_stock_retries_on_same_clone_document_and_only_creates_one_target(site_adapter, tmp_path, payload):
+    site, adapter = site_adapter
+    site.order_replies = [(200, payload)]
+    changes = []
+    task = RentalEngine(adapter, Store(tmp_path), config(),
+                        changed=lambda t:changes.append(dict(t)), wait=lambda _:None).run()
+    assert task['phase'] == 'completed' and task['stock_rejections'] == 1
+    assert len(site.orders) == 2 and site.creations == 1
+    assert task['target_uuid'] == TARGET
+    assert site.page_paths.count('/cloneInstance') == 1
+    assert site.order_page_views[0] == site.order_page_views[1]
+    assert any(t['phase']=='monitoring' and t.get('last_rejection_code')==payload['code'] for t in changes)
+    assert '/console/instance/list' in adapter.page.url
+
+
+def test_late_website_request_is_blocked_between_definite_stock_rejection_and_retry(site_adapter, tmp_path):
+    site, adapter = site_adapter
+    adapter.prepare(SOURCE)
+    site.order_replies = [(200, {'code':'MachineGpuNumUpdateFailed'})]
+    adapter.page.evaluate("""window.originalCreate=create;window.lateScheduled=false;
+        window.create=async()=>{await originalCreate();if(!window.lateScheduled){window.lateScheduled=true;
+          setTimeout(()=>originalCreate().catch(()=>{}),100)}};void 0""")
+    waits = []
+    def wait(seconds):
+        adapter.page.wait_for_timeout(300)
+        assert len(site.orders) == 1  # The late replay never reaches the server.
+        waits.append(seconds)
+    task = RentalEngine(adapter, Store(tmp_path), config(), wait=wait).run()
+    assert task['phase'] == 'completed' and waits == [1]
+    assert len(site.orders) == 2 and site.creations == 1
+
+
+def test_response_loss_on_retry_preserves_uncertainty_and_does_not_try_a_third_order(site_adapter, tmp_path):
+    site, adapter = site_adapter
+    site.order_replies = [(200, {'code':'NoStock'}), (503, {'code':'Failed'})]
+    task = RentalEngine(adapter, Store(tmp_path), config(), wait=lambda _:None).run()
+    assert task['phase'] == 'uncertain' and task['stock_rejections'] == 1
+    assert len(site.orders) == 2
+
+
+@pytest.mark.parametrize('code,message', [
+    ('TORecharge','余额不足'), ('TORealName','请完成实名认证'),
+    ('PermissionDenied','没有权限'), ('CloneCountLimit','今日克隆次数不足'),
+    ('UnknownFailure','未知错误'), ('TORecharge','空闲GPU数量不足，余额不足'),
+])
+def test_permanent_rejections_are_not_misclassified_as_stock_loss(site_adapter, tmp_path, code, message):
+    site, adapter = site_adapter
+    site.order_replies = [(200, {'code':code,'msg':message})]
+    task = RentalEngine(adapter, Store(tmp_path), config(), wait=lambda _:None).run()
+    assert task['phase'] == 'failed' and len(site.orders) == 1 and not site.creations
+    assert code in task['message'] and task['stock_rejections'] == 0
+
+
+@pytest.mark.parametrize('status,payload', [
+    (503, {'code':'MachineGpuNumUpdateFailed'}),
+    (200, {'code':'MachineGpuNumUpdateFailed','data':TARGET}),
+    (200, {'code':'NoStock','data':{'uuid':TARGET}}),
+    (200, {'msg':'空闲GPU数量不足'}),
+])
+def test_unconfirmed_responses_never_retry_even_with_stock_words(site_adapter, tmp_path, status, payload):
+    site, adapter = site_adapter
+    site.order_replies = [(status, payload)]
+    store = Store(tmp_path)
+    task = RentalEngine(adapter, store, config(), wait=lambda _:None).run()
+    assert task['phase'] == 'uncertain' and len(site.orders) == 1
+    with pytest.raises(ConsoleError, match='尚未确认'):
+        RentalEngine(adapter, store, config()).run()
+
+
+def test_a_blocked_duplicate_does_not_erase_uncertainty_of_a_forwarded_order(site_adapter, tmp_path):
+    site, adapter = site_adapter
+    adapter.prepare(SOURCE)
+    site.hold_order = True
+    adapter.RESPONSE_TIMEOUT = 350
+    adapter.page.evaluate("""window.originalCreate=create;
+        window.create=()=>{originalCreate().catch(()=>{});setTimeout(()=>originalCreate().catch(()=>{}),20)};void 0""")
+    store = Store(tmp_path)
+    task = RentalEngine(adapter, store, config()).run()
+    assert task['phase'] == 'uncertain' and len(site.orders) == 1 and len(site.held_orders) == 1
+    with pytest.raises(ConsoleError, match='尚未确认'):
+        RentalEngine(adapter, store, config()).run()
 
 
 def test_dom_only_enabled_offers_and_cancellation(site_adapter):

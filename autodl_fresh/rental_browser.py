@@ -10,7 +10,7 @@ from playwright.sync_api import Error as PlaywrightError, TimeoutError as Playwr
 
 from .browser import ActionRejected, Cancelled, ConsoleError, InventoryUnavailable, LayoutChanged, SessionExpired
 from .models import compact
-from .rental import GPUOffer, RentalOptions, money
+from .rental import GPUOffer, RentalOptions, StockLost, money
 
 
 class CloneConsole:
@@ -44,6 +44,8 @@ class CloneConsole:
         self.page_crashed = False
         self.page.on("crash", lambda *_: setattr(self, "page_crashed", True))
         self.sorted_idle_floor = None
+        self.order_attempt = None
+        self.order_guard_installed = False
         self.page.on("response", self._observe_instances)
         self.page.on("response", self._observe_quote)
         self.page.on("request", self._machine_request)
@@ -546,19 +548,74 @@ class CloneConsole:
         quote = self._quoted_cost()
         row = self._machine_row(offer.machine_id)
         if not row.locator('input[type="radio"]').is_checked():
-            raise ActionRejected("选中主机已变化")
-        forwarded, blocked = [], []
-        allow_order = True
+            raise StockLost("选中主机已变化，正在重新检查库存", code="SelectionChanged")
+        # One persistent gate per work page. A new attempt replaces its state;
+        # it never falls through a stack of closed guards from older attempts.
+        if not self.order_guard_installed:
+            self.page.route("**/api/v1/order/**", self._guard_order)
+            self.order_guard_installed = True
+        attempt = {"allowed": True, "offer": offer, "options": options, "quote": quote, "forwarded": []}
+        self.order_attempt = attempt
+        try:
+            submitted()
+            with self.page.expect_response(lambda r: urlsplit(r.url).path == self.ORDER_PATH
+                                           and r.request in attempt["forwarded"], timeout=self.RESPONSE_TIMEOUT) as event:
+                self.page.locator(".pay-wrap").get_by_role("button", name="创建并开机", exact=True).click()
+            response = event.value
+            payload = response.json()
+            if (response.status != 200 or not isinstance(payload, dict)
+                    or not isinstance(payload.get("code"), str) or not payload["code"]):
+                raise ConsoleError("创建响应不完整，请在网页核对，暂停新的租用")
+            if payload["code"] != "Success":
+                # A returned target or other nonempty result contradicts a
+                # clean rejection. Preserve the journal instead of retrying.
+                if payload.get("data") not in (None, "", {}, []):
+                    raise ConsoleError("创建响应未确认成功且含有结果数据，请先在网页核对，暂停新的租用")
+                code = payload["code"]
+                if self._stock_rejection(code, payload.get("msg", "")):
+                    raise StockLost("该主机空闲 GPU 已不足或被其他用户租走，平台未接受此次创建", code=code)
+                safe_code = code if re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", code) else "Unknown"
+                raise ActionRejected(f"平台拒绝创建（错误码：{safe_code}），请检查余额、权限、实名认证或克隆次数")
+            uuid = payload.get("data")
+            if not isinstance(uuid, str) or not self.console.ID_RE.fullmatch(uuid) or uuid == options.source_uuid:
+                raise ConsoleError("平台返回成功但新实例 ID 无法识别，请先在网页核对")
+            return uuid
+        except PlaywrightTimeoutError as exc:
+            if not attempt["forwarded"]:
+                raise ActionRejected("未发出有效创建请求，请检查页面是否出现兼容性或余额提示") from exc
+            raise ConsoleError("创建请求已发送但响应未确认，禁止重复下单；请在网页核对") from exc
+        finally:
+            # The gate stays installed, closed between attempts and after a
+            # timeout. A late website preflight must not submit a stray order.
+            attempt["allowed"] = False
 
-        def guard(route):
-            request = route.request
-            if request.method != "POST" or urlsplit(request.url).path == "/api/v1/order/price/preview":
-                route.fallback()
-                return
+    @staticmethod
+    def _stock_rejection(code, message):
+        message = compact(message[:1000]).upper() if isinstance(message, str) else ""
+        # Permanent account failures take precedence over textual stock hints.
+        if code in {"TORecharge", "TORealName", "AuthorizeFailed", "PermissionDenied", "Forbidden"}:
+            return False
+        if any(word in message for word in ("余额", "钱包", "实名", "权限", "克隆次数", "配额", "BALANCE", "QUOTA")):
+            return False
+        # MachineGpuNumUpdateFailed is the stock code handled by AutoDL's own
+        # frontend. A narrow message fallback covers generic error envelopes.
+        return code in {"MachineGpuNumUpdateFailed", "NoStock"} or any(text in message for text in (
+            "空闲GPU数量不足", "GPU数量不足", "GPU资源不足", "没有空闲GPU", "无可用GPU",
+            "GPU已被占用", "GPU已被租用", "主机已被占用", "主机资源不足", "该主机资源已售罄"))
+
+    def _guard_order(self, route):
+        request = route.request
+        if request.method != "POST" or urlsplit(request.url).path == "/api/v1/order/price/preview":
+            route.fallback()
+            return
+        attempt = self.order_attempt
+        valid = False
+        if attempt and attempt["allowed"] and not attempt["forwarded"]:
+            offer, options, quote = attempt["offer"], attempt["options"], attempt["quote"]
             try:
                 data = request.post_data_json
                 info, price = data["instance_info"], data["price_info"]
-                valid = (allow_order and urlsplit(request.url).path == self.ORDER_PATH
+                valid = (urlsplit(request.url).path == self.ORDER_PATH
                          and urlsplit(request.url).netloc == urlsplit(self.console.settings.console_url).netloc
                          and data["instance_uuid"] == options.source_uuid
                          and info["machine_id"] == price["machine_id"] == offer.machine_id
@@ -569,42 +626,14 @@ class CloneConsole:
                          == int(money(quote["expand_gb"]) * 1024**3)
                          and self.price_key == (offer.machine_id, options.gpu_count,
                                                 info.get("expand_data_disk", 0), "payg")
-                         and self.price_hourly is not None
-                         and not forwarded)
+                         and self.price_hourly is not None)
             except (KeyError, TypeError, ValueError):
-                valid = False
-            if not valid:
-                blocked.append(True)
-                route.abort()
-                return
-            forwarded.append(True)
-            route.fallback()
-
-        pattern = "**/api/v1/order/**"
-        self.page.route(pattern, guard)
-        try:
-            submitted()
-            with self.page.expect_response(lambda r: urlsplit(r.url).path == self.ORDER_PATH
-                                           and r.request.method == "POST", timeout=self.RESPONSE_TIMEOUT) as event:
-                self.page.locator(".pay-wrap").get_by_role("button", name="创建并开机", exact=True).click()
-            response = event.value
-            payload = response.json()
-            if response.status != 200 or not isinstance(payload, dict) or not payload.get("code"):
-                raise ConsoleError("创建响应不完整，请在网页核对，暂停新的租用")
-            if payload["code"] != "Success":
-                raise ActionRejected("平台拒绝创建，请检查库存、余额、克隆次数和权限")
-            uuid = payload.get("data")
-            if not isinstance(uuid, str) or not self.console.ID_RE.fullmatch(uuid) or uuid == options.source_uuid:
-                raise ConsoleError("平台返回成功但新实例 ID 无法识别，请先在网页核对")
-            return uuid
-        except PlaywrightTimeoutError as exc:
-            if blocked or not forwarded:
-                raise ActionRejected("未发出有效创建请求，请检查页面是否出现兼容性或余额提示") from exc
-            raise ConsoleError("创建请求已发送但响应未确认，禁止重复下单；请在网页核对") from exc
-        finally:
-            # Keep the guard until this work page closes. A slow website
-            # preflight must not submit a late order after we reported a timeout.
-            allow_order = False
+                pass
+        if not valid:
+            route.abort()
+            return
+        attempt["forwarded"].append(request)
+        route.fallback()
 
     def verify(self, task):
         uuid = task["target_uuid"]

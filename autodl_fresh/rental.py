@@ -15,6 +15,14 @@ PENDING_PHASES = {"submitted", "accepted", "uncertain"}
 GPU_COUNTS = (1, 2, 3, 4, 5, 6, 7, 8, 10, 12)
 
 
+class StockLost(ActionRejected):
+    """A definite stock rejection, or a changed selection before submission."""
+
+    def __init__(self, message, *, code=""):
+        super().__init__(message)
+        self.code = code
+
+
 def money(value) -> Decimal:
     try:
         result = Decimal(str(value))
@@ -119,7 +127,7 @@ class RentalEngine:
             raise ConsoleError("有保活任务尚未完成关机核验，请先处理再候租。")
         self.options.validate()
         self.task = {"phase": "monitoring", "started_at": now().isoformat(),
-                     "options": asdict(self.options), "attempts": 0, "target_uuid": ""}
+                     "options": asdict(self.options), "attempts": 0, "stock_rejections": 0, "target_uuid": ""}
         self._save(message="正在准备克隆页面")
         deadline = self.clock() + self.options.max_minutes * 60
         try:
@@ -156,6 +164,7 @@ class RentalEngine:
                                     key=lambda o: (rank[o.gpu_name], money(o.hourly_price), o.machine_id))
                 self._save(attempts=self.task["attempts"] + 1,
                            message=f"第 {self.task['attempts'] + 1} 次检查：{len(candidates)} 台符合型号及卡数")
+                stock_lost = False
                 for offer in candidates:
                     if self.cancel.is_set():
                         raise Cancelled("候租已停止，未提交创建")
@@ -175,13 +184,26 @@ class RentalEngine:
                         if self.cancel.is_set() or self.clock() >= deadline:
                             raise Cancelled("候租已停止，未提交创建")
                         self._save(phase="submitted", message="正在提交创建并开机，请勿重复下单")
-                    target_uuid = self.adapter.create(offer, self.options, submitted)
+                    try:
+                        target_uuid = self.adapter.create(offer, self.options, submitted)
+                    except StockLost as exc:
+                        # The platform explicitly rejected this attempt. Drop
+                        # the old snapshot and obtain fresh stock on the SAME
+                        # clone page before any subsequent paid click.
+                        stock_lost = True
+                        self._save(phase="monitoring", target_uuid="", offer={}, quote={},
+                                   stock_rejections=self.task["stock_rejections"] + 1,
+                                   last_rejection_code=exc.code, last_rejected_machine=offer.machine_id,
+                                   message=f"{exc}；{self.options.interval_seconds} 秒后继续候租")
+                        self.log(self.task["message"])
+                        break
                     self._save(phase="accepted", target_uuid=target_uuid,
                                message=f"平台已接受创建：{target_uuid}，正在核验运行状态与数据盘拷贝")
                     # Once a request was accepted, stopping does not abandon its
                     # verification, and must never turn off a GPU rented for use.
                     return self._verify()
-                self._save(message=f"暂无可租机器，{self.options.interval_seconds} 秒后重试")
+                if not stock_lost:
+                    self._save(message=f"暂无可租机器，{self.options.interval_seconds} 秒后重试")
                 self.wait(min(self.options.interval_seconds, max(0, deadline - self.clock())))
             self._save(phase="expired", message="已到最长候租时间，未创建实例")
         except Cancelled as exc:

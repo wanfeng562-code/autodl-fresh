@@ -1,6 +1,6 @@
 # Third-party notices and corresponding source
 
-AutoDL Fresh 0.7.5 uses independently licensed third-party software. The project's
+AutoDL Fresh 0.7.6 uses independently licensed third-party software. The project's
 non-commercial license applies only to the copyright holder's original work.
 It does **not** replace, narrow, or claim ownership over any third-party license.
 
@@ -45,7 +45,7 @@ configuration. See the LICENSE exception protecting these third-party rights.
 
 ## Other components
 
-| Component | Version in 0.7.5 | Upstream license / notices |
+| Component | Version in 0.7.6 | Upstream license / notices |
 | --- | --- | --- |
 | CPython runtime | 3.12.4 | Python Software Foundation license and bundled third-party notices |
 | Playwright for Python / driver | 1.64.1 | Apache-2.0; upstream NOTICE and ThirdPartyNotices.txt |

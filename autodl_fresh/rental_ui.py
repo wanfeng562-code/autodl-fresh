@@ -35,6 +35,7 @@ class RentalPanel(QWidget):
         self.quote_cache = QuoteCache(store)
         self.busy = False
         self.mode = ""
+        self._last_task_text = None
         self.catalog_source = ""
         self.saved = store.read("rental-options.json", {})
         self.instances = []
@@ -289,9 +290,12 @@ class RentalPanel(QWidget):
             if startup and task.get("phase") == "monitoring":
                 message = "上次候租已中断；重新开始后才会继续检查和租用。"
             self.status.setText(message)
-            self.details.appendPlainText(message)
-            if task.get("target_uuid"):
-                self.details.appendPlainText("新实例：" + task["target_uuid"])
+            signature = (message, task.get("target_uuid", ""))
+            if signature != self._last_task_text:
+                self.details.appendPlainText(message)
+                if task.get("target_uuid"):
+                    self.details.appendPlainText("新实例：" + task["target_uuid"])
+                self._last_task_text = signature
         self.set_busy(self.busy)
 
     def _resolve(self):

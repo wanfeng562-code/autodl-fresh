@@ -5,7 +5,7 @@ import pytest
 
 from autodl_fresh.browser import ActionRejected, ConsoleError, InventoryUnavailable
 from autodl_fresh.models import Instance
-from autodl_fresh.rental import GPUOffer, PENDING_PHASES, RentalEngine, RentalOptions
+from autodl_fresh.rental import GPUOffer, PENDING_PHASES, RentalEngine, RentalOptions, StockLost
 from autodl_fresh.storage import Store
 
 
@@ -175,10 +175,59 @@ def test_ambiguous_submission_survives_restart_and_blocks_duplicate(tmp_path):
 def test_explicit_rejection_stops_without_pending_order(tmp_path):
     store = Store(tmp_path)
     adapter = FakeClone(store)
-    adapter.error = ActionRejected("库存不足")
+    adapter.error = ActionRejected("余额不足")
     assert engine(store, adapter).run()["phase"] == "failed"
     assert store.read("rental-task.json")["phase"] not in PENDING_PHASES
     assert ("create", "m2") not in adapter.events
+
+
+def test_lost_stock_returns_to_monitoring_and_checks_fresh_inventory_before_retry(tmp_path):
+    store = Store(tmp_path)
+    adapter = FakeClone(store)
+    create = adapter.create
+    adapter.error = StockLost('空闲 GPU 已被其他用户租走', code='MachineGpuNumUpdateFailed')
+    changes, delays = [], []
+    def try_create(*args):
+        try:
+            return create(*args)
+        finally:
+            adapter.error = None
+    def wait(seconds):
+        record = store.read('rental-task.json')
+        assert record['phase'] == 'monitoring' and not record['target_uuid']
+        assert record['offer'] == {} and record['quote'] == {}
+        delays.append(seconds)
+        adapter.wait(seconds)
+    adapter.create = try_create
+    task = RentalEngine(adapter, store, options(), clock=lambda:adapter.clock, wait=wait,
+                        changed=lambda t:changes.append(dict(t))).run()
+    assert task['phase'] == 'completed' and task['attempts'] == 2 and task['stock_rejections'] == 1
+    assert delays == [1]
+    assert adapter.events == ['prepare','offers',('select','m1'),('create','m1'),
+                              'offers',('select','m1'),('create','m1'),'verify']
+    assert any(t['phase'] == 'monitoring' and '继续候租' in t['message'] for t in changes)
+
+
+def test_repeated_stock_losses_obey_original_deadline_without_pending_order(tmp_path):
+    store = Store(tmp_path)
+    adapter = FakeClone(store)
+    adapter.error = StockLost('库存不足', code='NoStock')
+    task = engine(store, adapter, options(max_minutes=1, interval_seconds=30)).run()
+    assert task['phase'] == 'expired' and task['stock_rejections'] == 2 and adapter.clock == 60
+    assert store.read('rental-task.json')['phase'] not in PENDING_PHASES
+    assert 'verify' not in adapter.events
+
+
+def test_stock_loss_can_be_cancelled_and_does_not_block_a_later_rental(tmp_path):
+    store, cancel = Store(tmp_path), threading.Event()
+    adapter = FakeClone(store)
+    adapter.error = StockLost('库存不足', code='NoStock')
+    def changed(task):
+        if task['phase'] == 'monitoring' and task['stock_rejections']:
+            cancel.set()
+    task = engine(store, adapter, cancel=cancel, changed=changed).run()
+    assert task['phase'] == 'cancelled' and task['stock_rejections'] == 1
+    assert engine(store, FakeClone(store)).run()['phase'] == 'completed'
 
 
 def test_copy_failure_keeps_target_and_recovery_never_creates_again(tmp_path):
