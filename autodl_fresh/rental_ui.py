@@ -4,13 +4,12 @@ from dataclasses import asdict
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QInputDialog,
+    QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBoxLayout,
     QLabel, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton,
     QScrollArea, QSpinBox, QVBoxLayout, QWidget,
 )
 
-from .models import now
-from .rental import GPU_COUNTS, PENDING_PHASES, RentalOptions, money
+from .rental import GPU_COUNTS, PENDING_PHASES, RentalOptions, confirm_rental_result, money
 from .quote_cache import QuoteCache
 from .widgets import protect_settings_scroll
 
@@ -28,6 +27,8 @@ class RentalPanel(QWidget):
     requested = Signal(str, object)
     stop_requested = Signal()
     logged = Signal(str)
+    confirmation_requested = Signal(str, object)
+    task_resolved = Signal(object)
 
     def __init__(self, store):
         super().__init__()
@@ -35,6 +36,7 @@ class RentalPanel(QWidget):
         self.quote_cache = QuoteCache(store)
         self.busy = False
         self.mode = ""
+        self._confirmation_pending = False
         self._last_task_text = None
         self.catalog_source = ""
         self.saved = store.read("rental-options.json", {})
@@ -124,14 +126,20 @@ class RentalPanel(QWidget):
         self.status = text("尚未启动候租", "heroTitle")
         layout.addWidget(self.status)
         recovery = QHBoxLayout()
-        self.verify_button = QPushButton("核验已创建实例")
+        self.verify_button = QPushButton("自动核验已创建实例")
         self.verify_button.clicked.connect(lambda: self.requested.emit("rental_verify", None))
         recovery.addWidget(self.verify_button)
-        self.resolve_button = QPushButton("网页核对后解除暂停")
+        self.complete_button = QPushButton("确认克隆已完成")
+        self.complete_button.clicked.connect(lambda: self._confirm("completed"))
+        recovery.addWidget(self.complete_button)
+        self.resolve_button = QPushButton("确认实例已释放")
         self.resolve_button.clicked.connect(self._resolve)
         recovery.addWidget(self.resolve_button)
         recovery.addStretch()
         layout.addLayout(recovery)
+        self.recovery_hint = text("已在网页确认克隆完成，或实例已释放 / 未创建时，可直接手动确认，无需等待自动核验。"
+                                  "确认后结束本次记录并关闭正在核验的专用浏览器；重新候租需手动开始。", "muted")
+        layout.addWidget(self.recovery_hint)
         self.details = QPlainTextEdit()
         self.details.setReadOnly(True)
         self.details.setMaximumBlockCount(300)
@@ -260,7 +268,7 @@ class RentalPanel(QWidget):
             if self.busy or self.catalog_source != self.source.currentData():
                 raise ValueError("请先加载本地区缓存；暂无缓存时请手动点击“重新核对报价”")
             if self.store.read("rental-task.json", {}).get("phase") in PENDING_PHASES:
-                raise ValueError("上次创建尚未确认，请先核验或在网页核对后解除暂停")
+                raise ValueError("上次创建尚未确认，请自动核验或手动确认克隆完成 / 实例已释放")
             options = self.options()
             options.validate()
             if not self.consent.isChecked():
@@ -276,15 +284,25 @@ class RentalPanel(QWidget):
         if mode or not busy:
             self.mode = mode
         self.config.setEnabled(not busy)
-        self.start_button.setEnabled(not busy)
         self.stop_button.setEnabled(busy and self.mode in {"rental", "rental_probe"})
         self.stop_button.setText("停止读取" if busy and self.mode == "rental_probe" else "停止候租")
         task = self.store.read("rental-task.json", {})
-        self.verify_button.setEnabled(not busy and task.get("phase") in PENDING_PHASES
-                                      and bool(task.get("target_uuid")))
-        self.resolve_button.setEnabled(not busy and task.get("phase") in PENDING_PHASES)
+        pending = task.get("phase") in PENDING_PHASES
+        target = bool(task.get("target_uuid"))
+        self.start_button.setEnabled(not busy and not pending)
+        self.verify_button.setEnabled(not busy and pending and target)
+        can_confirm = pending and not self._confirmation_pending and (
+            not busy or self.mode in {"rental", "rental_verify"} and target)
+        self.complete_button.setEnabled(can_confirm and target)
+        self.resolve_button.setEnabled(can_confirm)
+        self.resolve_button.setText("确认实例已释放" if target else "确认未创建实例")
+        self.recovery_hint.setVisible(pending)
 
     def show_task(self, task, *, startup=False):
+        if task.get("phase") not in PENDING_PHASES:
+            self._confirmation_pending = False
+        if task.get("verification") == "manual":
+            self.consent.setChecked(False)
         if task:
             message = task.get("message", "候租状态已保存")
             if startup and task.get("phase") == "monitoring":
@@ -299,28 +317,48 @@ class RentalPanel(QWidget):
         self.set_busy(self.busy)
 
     def _resolve(self):
-        if self.busy:
-            return
         task = self.store.read("rental-task.json", {})
-        if task.get("phase") not in PENDING_PHASES:
+        self._confirm("released" if task.get("target_uuid") else "not_created")
+
+    def _confirm(self, outcome):
+        task = self.store.read("rental-task.json", {})
+        if task.get("phase") not in PENDING_PHASES or self._confirmation_pending:
             return
+        if self.busy and (self.mode not in {"rental", "rental_verify"} or not task.get("target_uuid")):
+            return
+        uuid = task.get("target_uuid", "")
+        if outcome == "completed" and not uuid:
+            return
+        title, description = {
+            "completed": ("确认克隆已完成", "我已在 AutoDL 网页确认克隆和数据盘拷贝已完成，并接管此实例。"),
+            "released": ("确认实例已释放", "我已在 AutoDL 网页释放此实例，无需继续核验。"),
+            "not_created": ("确认未创建实例", "我已在 AutoDL 网页确认本次未创建实例，也没有排队或创建中的实例。"),
+        }[outcome]
         result = QMessageBox.question(
-            self, "核对创建结果",
-            "请先在 AutoDL 网页检查此次克隆及计费情况。\n"
-            "若实例已创建，请确认已记录新实例 ID 并接管使用或关机。若未创建，请确认没有排队或创建中的实例。\n\n"
-            "解除暂停后允许重新租用，可能新增计费。是否已完成核对？",
+            self, title, (f"新实例：{uuid}\n\n" if uuid else "") + description + "\n\n"
+            "确认后结束本次记录，停止等待并关闭本次核验的专用浏览器。不会自动重新下单。是否确认？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
         )
         if result != QMessageBox.StandardButton.Yes:
             return
-        source = task["options"]["source_uuid"]
-        value, ok = QInputDialog.getText(self, "确认已人工接管", f"输入源实例 ID 确认已核对：\n{source}")
-        if not ok or value.strip() != source:
+        current = self.store.read("rental-task.json", {})
+        if (current.get("phase") not in PENDING_PHASES or current.get("target_uuid") != uuid
+                or current.get("started_at") != task.get("started_at")):
+            self.show_task(current)
             return
-        task.update(phase="resolved", message="已由用户在网页核对并接管上次创建结果", updated_at=now().isoformat())
-        self.store.write("rental-task.json", task)
-        history = self.store.read("rental-history.json", [])
-        self.store.write("rental-history.json", [task, *history][:100])
-        self.consent.setChecked(False)
-        self.show_task(task)
-        self.logged.emit(task["message"])
+        if self.busy:
+            self._confirmation_pending = True
+            self.set_busy(True)
+            self.status.setText("已收到人工确认，正在结束核验并关闭专用浏览器…")
+            self.confirmation_requested.emit(outcome, task)
+            return
+        self.confirm_result(outcome, task)
+
+    def confirm_result(self, outcome, task):
+        # The worker must own writes while active. Idle/restart recovery needs
+        # neither a login nor a browser, and never starts a replacement order.
+        result = confirm_rental_result(self.store, outcome, expected=task)
+        self._confirmation_pending = False
+        self.show_task(result)
+        self.task_resolved.emit(result)
+        self.logged.emit(result.get("message", "人工确认已结束"))

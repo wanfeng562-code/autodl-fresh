@@ -15,6 +15,69 @@ PENDING_PHASES = {"submitted", "accepted", "uncertain"}
 GPU_COUNTS = (1, 2, 3, 4, 5, 6, 7, 8, 10, 12)
 
 
+def _task_identity(task):
+    return task.get("started_at"), task.get("target_uuid"), (task.get("options") or {}).get("source_uuid")
+
+
+def confirm_rental_result(store, outcome, *, expected):
+    """Record a user's result without a browser or any further order."""
+    if outcome not in {"completed", "released", "not_created"}:
+        raise ValueError("不支持的人工确认结果")
+    task = store.read("rental-task.json", {})
+    if task.get("phase") not in PENDING_PHASES or _task_identity(task) != _task_identity(expected):
+        return task
+    if outcome in {"completed", "released"} and not task.get("target_uuid"):
+        raise ValueError("没有已创建的新实例 ID，请先核对是否创建")
+    if outcome == "not_created" and task.get("target_uuid"):
+        raise ValueError("平台已返回新实例 ID，请确认克隆完成或实例已释放")
+    messages = {"completed": "已由用户确认克隆完成，本次候租已结束",
+                "released": "已由用户确认新实例已释放，本次候租已结束，可手动重新候租",
+                "not_created": "已由用户确认本次未创建实例，可手动重新候租"}
+    task.update(phase="completed" if outcome == "completed" else "resolved", verification="manual",
+                manual_result=outcome, message=messages[outcome], updated_at=now().isoformat())
+    store.write("rental-task.json", task)
+    history = store.read("rental-history.json", [])
+    store.write("rental-history.json", [task, *history][:100])
+    return task
+
+
+class ManualRentalConfirmation(Exception):
+    def __init__(self, outcome):
+        super().__init__(outcome)
+        self.outcome = outcome
+
+
+class RentalConfirmation:
+    """UI requests; the worker alone finishes its active journal and browser."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._event = threading.Event()
+        self._request = None
+
+    def request(self, outcome, task):
+        if outcome not in {"completed", "released"} or not task.get("target_uuid"):
+            raise ValueError("请先核对新实例结果")
+        with self._lock:
+            if self._request is None:
+                self._request = (_task_identity(task), outcome)
+                self._event.set()
+
+    def check(self, task):
+        outcome = self.result(task)
+        if outcome:
+            raise ManualRentalConfirmation(outcome)
+
+    def result(self, task):
+        with self._lock:
+            if self._request and self._request[0] == _task_identity(task):
+                return self._request[1]
+        return ""
+
+    def wait(self, seconds):
+        self._event.wait(seconds)
+
+
 class StockLost(ActionRejected):
     """A definite stock rejection, or a changed selection before submission."""
 
@@ -71,13 +134,15 @@ class GPUOffer:
 
 class RentalEngine:
     def __init__(self, adapter, store, options, *, log=None, changed=None, cancel=None,
-                 clock=time.monotonic, wait=None):
+                 clock=time.monotonic, wait=None, confirmation=None):
         self.adapter, self.store, self.options = adapter, store, options
         self.log = log or (lambda _: None)
         self.changed = changed or (lambda _: None)
         self.cancel = cancel or threading.Event()
         self.clock = clock
         self.wait = wait or self.cancel.wait
+        self.confirmation = confirmation or RentalConfirmation()
+        self.adapter.confirmation = self.confirmation
         self.task = {}
 
     def _error_detail(self, exc, *, pending):
@@ -87,7 +152,8 @@ class RentalEngine:
             diagnostic = ("检测到工作页崩溃。" if state.get("page_crashed") else
                           "检测到浏览器连接断开。" if state.get("browser_connected") is False else
                           "检测到工作标签已关闭，浏览器仍连接。" if state.get("page_closed") else "")
-            return diagnostic + ("浏览器或工作页已关闭，或浏览器进程已退出。已保留创建记录，请先核验，禁止重复下单。"
+            return diagnostic + ("浏览器或工作页已关闭，或浏览器进程已退出。已保留创建记录，"
+                                  "可在应用中手动确认克隆完成或实例已释放，也可继续自动核验。"
                     if pending else "浏览器或工作页已关闭，或浏览器进程已退出。本轮未提交创建，可以重新开始候租。")
         return str(exc)
 
@@ -101,8 +167,23 @@ class RentalEngine:
         self.store.write("rental-history.json", [self.task, *history][:100])
 
     def _verify(self):
-        target = self.adapter.verify(self.task)
+        try:
+            self.confirmation.check(self.task)
+            try:
+                target = self.adapter.verify(self.task)
+            except Exception:
+                # A user may confirm while a network request or closed browser
+                # is returning an error. Their result must not be overwritten.
+                self.confirmation.check(self.task)
+                raise
+            self.confirmation.check(self.task)
+        except ManualRentalConfirmation as exc:
+            self.task = confirm_rental_result(self.store, exc.outcome, expected=self.task)
+            self.changed(dict(self.task))
+            self.log(self.task["message"])
+            return dict(self.task)
         self._save(phase="completed", target_uuid=target.uuid,
+                   verification="automatic",
                    message=f"克隆完成：{target.uuid}，系统盘克隆及数据盘拷贝已完成。")
         self._archive()
         self.log(self.task["message"] + " 本次候租已结束，请使用后自行关机。")
@@ -119,7 +200,7 @@ class RentalEngine:
                 return self._verify()
             except Exception as exc:
                 detail = self._error_detail(exc, pending=True)
-                self._save(message=f"新实例仍需核验：{detail}")
+                self._save(message=f"自动核验已结束：{detail}")
                 raise ConsoleError(detail) from exc
         if previous.get("phase") in PENDING_PHASES:
             raise ConsoleError("上次创建结果尚未确认，请先核验；暂停新的租用以免重复下单。")

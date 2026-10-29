@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autodl-fresh"
-version = "0.7.7"
+version = "0.7.8"
 description = "AutoDL 实例保活与 GPU 候租桌面助手"
 authors = [{name = "wanfeng562-code"}]
 license = "LicenseRef-AutoDLFresh-NonCommercial-1.0"

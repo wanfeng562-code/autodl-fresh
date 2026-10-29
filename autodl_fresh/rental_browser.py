@@ -53,6 +53,7 @@ class CloneConsole:
         self.machine_success = 0
         self.machine_auth_failed = False
         self.cancel = None
+        self.confirmation = None
         self.page_crashed = False
         self.page.on("crash", lambda *_: setattr(self, "page_crashed", True))
         self.sorted_idle_floor = None
@@ -648,21 +649,38 @@ class CloneConsole:
             border-radius:12px}h1{font-size:26px}p{line-height:1.8}code{color:#23855d}</style>
             <main><h1>克隆实例已创建</h1><p>新实例：<code>""" + escape(uuid) + """</code></p>
             <p id="clone-progress">正在等待系统盘克隆和数据盘拷贝完成…</p>
-            <p>完成后将自动关闭本次专用浏览器。</p></main></html>""")
+            <p>完成后将自动关闭本次专用浏览器。已在网页确认完成或释放？可回到应用直接手动确认。</p></main></html>""")
         deadline = time.monotonic() + self.console.settings.timeout_seconds
+        missing = 0
         while time.monotonic() < deadline:
+            if self.confirmation:
+                self.confirmation.check(task)
             try:
                 state = self._target_state(uuid)
             except InventoryUnavailable:
+                missing = 0
                 state = None
+            else:
+                missing = missing + 1 if state is None else 0
+                if missing >= 3:
+                    raise ConsoleError("连续 3 次未找到新实例，可能已被释放。自动核验已结束；"
+                                       "请在应用中点击“确认实例已释放”或“确认克隆已完成”，即可结束本次记录")
             if state:
                 clone, copy, status = state["clone"].casefold(), state["copy"].casefold(), state["status"].casefold()
-                if clone in {"failed", "error"} or copy in {"failed", "error"} or status in {"create_failed", "removing", "removed"}:
-                    raise ConsoleError("新实例克隆或数据盘拷贝失败，请在网页处理；已保留新实例 ID，不会重复下单")
+                if status in {"removing", "removed", "deleted", "deleting", "released"}:
+                    raise ConsoleError("新实例正在释放或已释放，自动核验已结束；"
+                                       "请点击“确认实例已释放”，即可结束本次记录并手动重新候租")
+                if clone in {"failed", "error"} or copy in {"failed", "error"} or status == "create_failed":
+                    raise ConsoleError("新实例克隆或数据盘拷贝失败，请在网页处理后手动确认结果；已保留新实例 ID")
                 if clone in {"", "success", "succeed", "succeeded"} and copy in {"success", "succeed", "succeeded"}:
                     return Instance(uuid)
-            self.page.wait_for_timeout(self.console.settings.poll_seconds * 1000)
-        raise ConsoleError(f"等待 {uuid} 克隆完成超时；请点击“核验已创建实例”，只查询这一台，不会重新下单")
+            if self.confirmation:
+                self.confirmation.wait(self.console.settings.poll_seconds)
+            else:
+                self.page.wait_for_timeout(self.console.settings.poll_seconds * 1000)
+        if self.confirmation:
+            self.confirmation.check(task)
+        raise ConsoleError(f"等待 {uuid} 克隆完成超时；可手动确认克隆完成或实例已释放，也可继续自动核验，不会重新下单")
 
     def _target_state(self, uuid):
         base = urlsplit(self.console.settings.console_url)

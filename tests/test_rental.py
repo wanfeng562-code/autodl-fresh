@@ -5,7 +5,7 @@ import pytest
 
 from autodl_fresh.browser import ActionRejected, ConsoleError, InventoryUnavailable
 from autodl_fresh.models import Instance
-from autodl_fresh.rental import GPUOffer, PENDING_PHASES, RentalEngine, RentalOptions, StockLost
+from autodl_fresh.rental import GPUOffer, PENDING_PHASES, RentalConfirmation, RentalEngine, RentalOptions, StockLost
 from autodl_fresh.storage import Store
 
 
@@ -287,3 +287,17 @@ def test_old_price_limits_are_ignored_and_known_target_recovery_still_works(tmp_
     recovery = FakeClone(store)
     assert engine(store, recovery).run(recover=True)["phase"] == "completed"
     assert recovery.events == ["verify"]
+
+
+def test_user_release_after_acceptance_ends_task_and_allows_only_an_explicit_new_run(tmp_path):
+    store, confirmation = Store(tmp_path), RentalConfirmation()
+    adapter = FakeClone(store)
+    def changed(task):
+        if task['phase'] == 'accepted':
+            confirmation.request('released', task)
+    result = engine(store, adapter, confirmation=confirmation, changed=changed).run()
+    assert result['phase'] == 'resolved' and result['manual_result'] == 'released'
+    assert 'verify' not in adapter.events
+    assert len([e for e in adapter.events if isinstance(e, tuple) and e[0] == 'create']) == 1
+    next_run = FakeClone(store)
+    assert engine(store, next_run).run()['phase'] == 'completed'

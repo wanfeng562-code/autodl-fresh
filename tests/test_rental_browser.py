@@ -311,6 +311,52 @@ def test_recovery_queries_known_target_without_loading_source_or_instance_pages(
     assert len(site.status_queries) == 1
 
 
+def test_released_target_missing_stops_after_three_reads_and_can_be_manually_resolved(site_adapter, tmp_path):
+    from autodl_fresh.rental import confirm_rental_result
+    site, adapter = site_adapter
+    adapter.console.settings.poll_seconds = .02
+    store = Store(tmp_path)
+    old = {'phase':'accepted','target_uuid':TARGET,
+           'options':{'source_uuid':SOURCE,'gpu_names':['RTX 4090']}}
+    store.write('rental-task.json', old)
+    with pytest.raises(ConsoleError, match='连续 3 次未找到'):
+        RentalEngine(adapter, store, config()).run(recover=True)
+    assert len(site.status_queries) == 3 and not site.orders and not site.page_paths
+    result = confirm_rental_result(store, 'released', expected=old)
+    assert result['phase'] == 'resolved' and result['manual_result'] == 'released'
+
+
+@pytest.mark.parametrize('status', ['removing','removed'])
+def test_explicitly_released_target_never_waits_for_copy(site_adapter, tmp_path, status):
+    site, adapter = site_adapter
+    site.target, site.target_status, site.copy_status = True, status, 'Running'
+    store = Store(tmp_path)
+    store.write('rental-task.json', {'phase':'accepted','target_uuid':TARGET,
+                'options':{'source_uuid':SOURCE,'gpu_names':['RTX 4090']}})
+    with pytest.raises(ConsoleError, match='请点击“确认实例已释放”'):
+        RentalEngine(adapter, store, config()).run(recover=True)
+    assert len(site.status_queries) == 1 and not site.orders and not site.page_paths
+
+
+def test_manual_confirmation_interrupts_a_long_poll_without_another_status_request(site_adapter, tmp_path):
+    from autodl_fresh.rental import RentalConfirmation
+    site, adapter = site_adapter
+    site.target, site.copy_status = True, 'Running'
+    adapter.console.settings.poll_seconds = 30
+    store, confirmation = Store(tmp_path), RentalConfirmation()
+    store.write('rental-task.json', {'phase':'accepted','target_uuid':TARGET,
+                'options':{'source_uuid':SOURCE,'gpu_names':['RTX 4090']}})
+    post = adapter.request_client.post
+    def confirm_after_read(*args, **kwargs):
+        response = post(*args, **kwargs)
+        confirmation.request('completed', store.read('rental-task.json'))
+        return response
+    adapter.request_client.post = confirm_after_read
+    result = RentalEngine(adapter, store, config(), confirmation=confirmation).run(recover=True)
+    assert result['phase'] == 'completed' and result['verification'] == 'manual'
+    assert len(site.status_queries) == 1 and not site.orders and not site.page_paths
+
+
 def test_dom_source_region_mismatch_fails_before_any_order(site_adapter):
     site, adapter = site_adapter
     site.wrong_region = True

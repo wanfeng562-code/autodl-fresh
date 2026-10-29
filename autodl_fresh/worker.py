@@ -37,6 +37,8 @@ class BrowserWorker(QThread):
         self.cancel = threading.Event()
         self.save_login = threading.Event()
         self.rental_options = None
+        from .rental import RentalConfirmation
+        self.rental_confirmation = RentalConfirmation()
 
     def run(self):
         try:
@@ -85,7 +87,7 @@ class BrowserWorker(QThread):
                                     self.log.emit("新实例已创建；登录态未能另存，现有登录文件保留。")
                         result = RentalEngine(
                             adapter, self.store, self.rental_options, log=self.log.emit,
-                            changed=rental_changed, cancel=self.cancel,
+                            changed=rental_changed, cancel=self.cancel, confirmation=self.rental_confirmation,
                         ).run(recover=self.mode == "rental_verify")
                         if result["phase"] in {"failed", "uncertain"}:
                             if "登录" in result["message"]:

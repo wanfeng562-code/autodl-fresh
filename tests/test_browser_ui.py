@@ -217,7 +217,6 @@ def test_hidden_quote_window_has_no_visible_taskbar_window_and_uses_separate_pro
     normal = NativeBrowser(settings, store)
     hidden = NativeBrowser(settings, store, window_mode="hidden")
     assert normal.profile != hidden.profile
-    previous_foreground = foreground_process()
     visible = []
     try:
         with browser_session(settings, store, native=hidden, window_mode="hidden") as (console, context):
@@ -243,7 +242,9 @@ def test_hidden_quote_window_has_no_visible_taskbar_window_and_uses_separate_pro
                 return True
             user32.EnumWindows(callback_type(visit), 0)
             assert visible == [False]
-            assert foreground_process() == previous_foreground
+            # Windows can choose a different foreground app (or initially have
+            # none). Only this dedicated hidden browser must never be active.
+            assert foreground_process() != process_id
     finally:
         close_native(hidden)
 

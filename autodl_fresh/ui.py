@@ -249,6 +249,8 @@ class MainWindow(QMainWindow):
         self.rental_panel.requested.connect(self._request_rental)
         self.rental_panel.stop_requested.connect(self._cancel)
         self.rental_panel.logged.connect(self._rental_log)
+        self.rental_panel.confirmation_requested.connect(self._confirm_rental)
+        self.rental_panel.task_resolved.connect(self._rental_updated)
         self.stack.addWidget(self.rental_panel)
         layout.addWidget(self.stack)
         bottom = QHBoxLayout()
@@ -754,6 +756,12 @@ class MainWindow(QMainWindow):
     def _request_rental(self, mode, options):
         self._start(mode, rental_options=options)
 
+    def _confirm_rental(self, outcome, task):
+        if self.worker and self.worker.mode in {"rental", "rental_verify"}:
+            self.worker.rental_confirmation.request(outcome, task)
+        elif not self.worker:
+            self.rental_panel.confirm_result(outcome, task)
+
     def _start(self, mode, *, scheduled=False, rental_options=None):
         if self._quitting:
             return
@@ -805,7 +813,10 @@ class MainWindow(QMainWindow):
         self._update_status()
         uuid = task.get("target_uuid", "")
         if task.get("phase") == "completed" and uuid:
-            self.rental_success_text.setText("克隆已完成，数据盘已就绪 · " + uuid)
+            self.rental_success_text.setText(("已由你确认克隆完成 · " if task.get("verification") == "manual"
+                                              else "克隆已完成，数据盘已就绪 · ") + uuid)
+        if task.get("manual_result") == "released" and self.rental_completed_uuid == uuid:
+            self.rental_success_banner.hide()
         if task.get("phase") in {"accepted", "gpu_running", "completed"} and uuid and uuid not in self._notified_rentals:
             self._notified_rentals.add(uuid)
             self.rental_completed_uuid = uuid
@@ -836,6 +847,14 @@ class MainWindow(QMainWindow):
     def _worker_finished(self):
         worker = self.worker
         self.worker = None
+        if worker and worker.mode in {"rental", "rental_verify"}:
+            from .rental import PENDING_PHASES
+            task = self.store.read("rental-task.json", {})
+            outcome = worker.rental_confirmation.result(task)
+            if outcome and task.get("phase") in PENDING_PHASES:
+                # Finish a confirmation that arrived as the worker was exiting.
+                # No worker can overwrite the journal after this point.
+                self.rental_panel.confirm_result(outcome, task)
         if worker:
             worker.deleteLater()
         for item in (self.login_button, self.preview_button, self.run_button, self.run_all_button, self.save_button, self.resolve_button):
@@ -1097,7 +1116,7 @@ class MainWindow(QMainWindow):
             self.hero_sub.setText(f"{pending['uuid']} · 点击“检查并刷新”继续核验。请勿重复手动开机。")
         elif rental_pending:
             self.hero_title.setText("有一次 GPU 候租创建需要核验")
-            self.hero_sub.setText("点击“查看候租”核验新实例或查看创建记录，核验前暂停新的租用与保活刷新。")
+            self.hero_sub.setText("点击“查看候租”自动核验，或手动确认克隆完成 / 实例已释放，即可结束本次记录。")
         elif self.auth_valid:
             self.hero_title.setText("登录态已保存，可以开始检查")
             self.hero_sub.setText("只读检查可预览全部实例；启用每日计划后将按设定时间自动处理。")
