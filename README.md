@@ -2,12 +2,12 @@
 
 AutoDL 普通容器实例的中文桌面保活助手，使用 Python、Playwright 和 PySide6 构建。
 
-**当前正式版：0.6.0** · Windows 10 / 11 x64 · **仅限非商业使用**
+**当前正式版：0.7.8** · Windows 10 / 11 x64 · **仅限非商业使用**
 
-开发版 **0.7.8** 新增「GPU 候租」，使用方法见下文。上方版本号及下载链接仍指向已发布的正式版。
+0.7.8 正式版包含「GPU 候租」、库存竞争重试、内置报价缓存和克隆结果人工确认，使用方法见下文。
 
-[下载 Windows 正式版](https://github.com/wanfeng562-code/autodl-fresh/releases/download/v0.6.0/AutoDLFresh-0.6.0-windows-x64.zip)
-| [发布说明](https://github.com/wanfeng562-code/autodl-fresh/releases/tag/v0.6.0)
+[下载 Windows 正式版](https://github.com/wanfeng562-code/autodl-fresh/releases/download/v0.7.8/AutoDLFresh-0.7.8-windows-x64.zip)
+| [发布说明](https://github.com/wanfeng562-code/autodl-fresh/releases/tag/v0.7.8)
 | [许可协议](LICENSE)
 | [更新日志](CHANGELOG.md)
 
@@ -24,7 +24,7 @@ AutoDL 普通容器实例的中文桌面保活助手，使用 Python、Playwrigh
 - 可查看和更换数据目录；设置中的下拉框和数值控件需先点击才能用滚轮修改。
 - 逐显示器 DPI 支持，适配 Windows 系统缩放。
 - 软件内检查 GitHub 最新正式版本，新版本提示、后台下载、取消和 SHA-256 校验。
-- 0.7.8 开发版：同地区 GPU 候租，内置 JSON 参考报价、手动报价复核、优先顺序、卡数及等待时间配置，库存被抢后继续候租；创建成功立即通知，只等待新实例克隆完成后关闭专用浏览器。
+- 同地区 GPU 候租，内置 JSON 参考报价、手动报价复核、优先顺序、卡数及等待时间配置，库存被抢后继续候租；创建成功立即通知，自动等待或人工确认后关闭专用浏览器。
 
 ![AutoDL Fresh 实例总览（模拟数据）](docs/overview.png)
 
@@ -47,7 +47,7 @@ AutoDL 普通容器实例的中文桌面保活助手，使用 Python、Playwrigh
 升级前先从托盘退出旧程序，再启动新版。已有登录态和设置继续使用；
 如启用了 Windows 自启动，在新版点一次「保存设置」更新启动路径。
 
-## GPU 候租（0.7.8 开发版）
+## GPU 候租
 
 1. 保存 AutoDL 登录态后进入侧栏「GPU 候租」，点击「读取实例」，选择已关机且状态正常的源实例。
 2. 选择源实例后自动显示该地区的 JSON 缓存型号与报价；「加载缓存型号与报价」也仅读取缓存，不打开浏览器。默认勾选原型号，也可勾选替代型号并调整优先顺序，4090、4090D 等精确区分。如需更新或该地区暂无缓存，请手动点击「重新核对报价」：这会在最小化浏览器中逐个勾选型号并读取主机表格，包括已占用主机，完整读取通常至少需要 2 分钟。进度与报价逐项更新，支持停止。

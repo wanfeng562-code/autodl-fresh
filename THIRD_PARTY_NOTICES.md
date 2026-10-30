@@ -19,8 +19,8 @@ No commercial Qt license is represented as having been acquired.
 Full license texts, including the GPLv3 text incorporated by LGPLv3 and embedded
 third-party attributions, are included under `licenses/third-party`.
 
-The [v0.6.0 release](https://github.com/wanfeng562-code/autodl-fresh/releases/tag/v0.6.0)
-offers **AutoDLFresh-0.6.0-third-party-sources.zip**, containing the complete,
+The [v0.7.8 release](https://github.com/wanfeng562-code/autodl-fresh/releases/tag/v0.7.8)
+offers **AutoDLFresh-0.7.8-third-party-sources.zip**, containing the complete,
 unmodified source archives for the Qt components shipped by this application:
 
 - [Qt Base 6.10.2](https://download.qt.io/official_releases/qt/6.10/6.10.2/submodules/qtbase-everywhere-src-6.10.2.tar.xz)
