@@ -2,14 +2,14 @@
 
 AutoDL 普通容器实例的中文桌面保活助手，使用 Python、Playwright 和 PySide6 构建。
 
-**当前正式版：0.7.8** · Windows 10 / 11 x64 · **仅限非商业使用**
+**当前正式版：0.7.9** · Windows 10 / 11 x64 · **仅限非商业使用**
 
-本地修复版 **0.7.9** 修复候租过程中偶发的实时报价暂停；正式版下载链接见下方。
+0.7.9 修复候租过程中偶发的实时报价暂停；暂时读取失败时会按原间隔继续候租。
 
-0.7.8 正式版包含「GPU 候租」、库存竞争重试、内置报价缓存和克隆结果人工确认，使用方法见下文。
+包含「GPU 候租」、库存竞争重试、内置报价缓存和克隆结果人工确认，使用方法见下文。
 
-[下载 Windows 正式版](https://github.com/wanfeng562-code/autodl-fresh/releases/download/v0.7.8/AutoDLFresh-0.7.8-windows-x64.zip)
-| [发布说明](https://github.com/wanfeng562-code/autodl-fresh/releases/tag/v0.7.8)
+[下载 Windows 正式版](https://github.com/wanfeng562-code/autodl-fresh/releases/download/v0.7.9/AutoDLFresh-0.7.9-windows-x64.zip)
+| [发布说明](https://github.com/wanfeng562-code/autodl-fresh/releases/tag/v0.7.9)
 | [许可协议](LICENSE)
 | [更新日志](CHANGELOG.md)
 
