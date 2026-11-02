@@ -12,7 +12,7 @@ from playwright.sync_api import Error as PlaywrightError, TimeoutError as Playwr
 
 from .browser import ActionRejected, Cancelled, ConsoleError, InventoryUnavailable, LayoutChanged, SessionExpired
 from .models import Instance, compact
-from .rental import GPUOffer, RentalOptions, StockLost, money
+from .rental import GPUOffer, QuoteUnavailable, RentalOptions, StockLost, money
 
 
 class CloneConsole:
@@ -23,6 +23,8 @@ class CloneConsole:
     ORDER_PATH = "/api/v1/order/instance/clone/payg"
     RESPONSE_TIMEOUT = 25000
     MACHINE_PATH = "/api/v1/user/machine/list"
+    PRICE_PATH = "/api/v1/order/price/preview"
+    QUOTE_TIMEOUT_SECONDS = 15
 
     def __init__(self, console, *, auth_state=None, request_client=None):
         self.console, self.page = console, console.page
@@ -46,6 +48,9 @@ class CloneConsole:
         self.price_key = None
         self.price_hourly = None
         self.price_disk_daily = None
+        self.price_latest = None
+        self.price_failed = False
+        self.price_auth_failed = False
         self.machine_pending = set()
         self.machine_failed = False
         self.machine_latest = None
@@ -71,10 +76,13 @@ class CloneConsole:
                 "browser_connected": bool(browser and browser.is_connected())}
 
     def _machine_request(self, request):
-        if urlsplit(request.url).netloc == urlsplit(self.console.settings.console_url).netloc:
+        if urlsplit(request.url)[:2] == urlsplit(self.console.settings.console_url)[:2]:
             token = request.headers.get("authorization")
             if token:
                 self.authorization = token
+            if urlsplit(request.url).path == self.PRICE_PATH:
+                self._reset_quote()
+                self.price_latest = request
         if urlsplit(request.url).path == self.MACHINE_PATH:
             self.machine_pending.add(request)
             self.machine_latest = request
@@ -83,6 +91,8 @@ class CloneConsole:
             self.sorted_idle_floor = None
 
     def _machine_failed(self, request):
+        if request is self.price_latest:
+            self.price_failed = True
         if request in self.machine_pending:
             if request is self.machine_latest and request.failure != "net::ERR_ABORTED":
                 self.machine_failed = True
@@ -125,6 +135,12 @@ class CloneConsole:
         self.machine_failed = False
         self.machine_auth_failed = False
         self.sorted_idle_floor = None
+        self._reset_quote()
+
+    def _reset_quote(self):
+        self.price_latest = None
+        self.price_key, self.price_hourly, self.price_disk_daily = None, None, None
+        self.price_failed = self.price_auth_failed = False
 
     def show_status(self, task):
         if self.console.settings.browser_visibility != "foreground" or urlsplit(self.page.url).path != "/cloneInstance":
@@ -147,25 +163,39 @@ class CloneConsole:
             pass
 
     def _observe_quote(self, response):
-        if urlsplit(response.url).path != "/api/v1/order/price/preview":
+        if urlsplit(response.url).path != self.PRICE_PATH or response.request is not self.price_latest:
             return
-        self.price_key, self.price_hourly, self.price_disk_daily = None, None, None
         try:
+            if response.status in {401, 403}:
+                self.price_auth_failed = True
+                return
             data = response.request.post_data_json
             payload = response.json()
-            if response.status == 200 and payload.get("code") == "Success":
-                values = payload["data"]
-                for discount in values.get("discount_list", []):
-                    if discount.get("product_type") == "instance":
-                        self.price_hourly = money(money(discount["origin_price"])
-                                                  - money(discount["total_reduction"])) / 1000
-                disk = values.get("data_disk_info") or {}
-                if "data_disk_deal_daily_price" in disk:
-                    self.price_disk_daily = money(disk["data_disk_deal_daily_price"]) / 1000
-                self.price_key = (data["machine_id"], int(data["num"]),
-                                  int(data.get("expand_data_disk", 0)), data["charge_type"])
+            # Reading the response body dispatches other Playwright events. A
+            # newer preview may have started while this body was being read.
+            if response.request is not self.price_latest:
+                return
+            self.price_auth_failed = payload.get("code") == "AuthorizeFailed"
+            if response.status != 200 or payload.get("code") != "Success":
+                self.price_failed = True
+                return
+            values = payload["data"]
+            hourly = None
+            for discount in values.get("discount_list", []):
+                if discount.get("product_type") == "instance":
+                    hourly = money(money(discount["origin_price"]) - money(discount["total_reduction"])) / 1000
+            if hourly is None:
+                self.price_failed = True
+                return
+            disk = values.get("data_disk_info") or {}
+            daily = (money(disk["data_disk_deal_daily_price"]) / 1000
+                     if "data_disk_deal_daily_price" in disk else None)
+            self.price_key = (data["machine_id"], int(data["num"]),
+                              int(data.get("expand_data_disk", 0)), data["charge_type"])
+            self.price_hourly, self.price_disk_daily = hourly, daily
         except (ValueError, TypeError, KeyError, AttributeError, PlaywrightError):
-            self.price_key = None
+            if response.request is self.price_latest:
+                self.price_failed = True
 
     def prepare(self, uuid):
         try:
@@ -403,6 +433,9 @@ class CloneConsole:
     def _offers(self, options, cancel):
         self._check_cancel(cancel)
         self._assert_page()
+        # Retain only previews initiated in this inventory round. A valid
+        # preview arriving while the table updates must survive select().
+        self._reset_quote()
         self._apply_filters(options)
         # Put idle cards first through the website's own sort control. This lets
         # an empty stock check finish without scrolling hundreds of busy hosts.
@@ -480,9 +513,9 @@ class CloneConsole:
         text = compact(self.page.locator(".pay-wrap .sum").inner_text())
         match = re.search(r"配置费用[：:][￥¥](\d+(?:\.\d+)?)/(?:时|小时)", text)
         if not match:
-            raise LayoutChanged("无法确认最终每小时配置费用，未提交创建")
+            raise QuoteUnavailable("页面最终费用仍在更新，未提交创建")
         if self.price_hourly is None:
-            raise LayoutChanged("未读取到平台配置费用的精确报价，未提交创建")
+            raise QuoteUnavailable("平台配置费用的实时报价暂未就绪，未提交创建")
         hourly = max(money(match[1]), self.price_hourly)
         daily = Decimal(0)
         disk = self.page.locator(".data-disk")
@@ -496,7 +529,7 @@ class CloneConsole:
                 raise LayoutChanged("无法识别数据盘每日扩容费用，未提交创建")
             daily = money(rate[1]) * size_gb
             if self.price_disk_daily is None:
-                raise LayoutChanged("未读取到平台数据盘每日精确报价，未提交创建")
+                raise QuoteUnavailable("平台数据盘的实时报价暂未就绪，未提交创建")
             daily = max(daily, self.price_disk_daily)
         return {"hourly": str(hourly), "disk_daily": str(daily), "expand_gb": str(size_gb)}
 
@@ -505,10 +538,11 @@ class CloneConsole:
             return self._select(offer, options)
         except PlaywrightTimeoutError as exc:
             self.console._check_origin()
-            raise InventoryUnavailable("选机页面读取超时，将自动重试") from exc
+            raise QuoteUnavailable("选机或报价请求暂未完成，未提交创建") from exc
 
     def _select(self, offer, options):
-        self.price_key = None
+        # Clicking an already-selected host may not issue another preview.
+        # Keep a matching response obtained in this same inventory round.
         self._assert_page()
         current = self._find_available(offer)
         if not current or current.gpu_name != offer.gpu_name or current.idle < options.gpu_count:
@@ -525,9 +559,14 @@ class CloneConsole:
                 return None
             if not control.is_checked():
                 control.locator("xpath=..").click()
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + self.QUOTE_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
+            self._check_cancel(self.cancel)
             self.page.wait_for_timeout(100)
+            if self.price_auth_failed:
+                raise SessionExpired("AutoDL 报价登录态已过期，请重新登录")
+            if self.price_failed:
+                raise QuoteUnavailable("所选主机的实时报价请求暂未成功，未提交创建")
             if self.price_key is None:
                 continue
             expansion = self.page.locator(".data-disk").locator('input[type="text"]')
@@ -535,12 +574,15 @@ class CloneConsole:
             expected = (offer.machine_id, options.gpu_count,
                         int(size_gb * 1024**3), "payg")
             if self.price_key == expected:
-                quote = self._quoted_cost()
+                try:
+                    quote = self._quoted_cost()
+                except QuoteUnavailable:
+                    continue  # The API can finish just before Vue updates the fee.
                 break
         else:
-            raise LayoutChanged("未收到所选主机和卡数的最新报价，未提交创建")
+            raise QuoteUnavailable("暂未收到与所选主机、卡数和数据盘匹配的实时报价，未提交创建")
         if not row.locator('input[type="radio"]').is_checked():
-            raise LayoutChanged("目标主机选择未生效")
+            raise InventoryUnavailable("目标主机选择随库存变化失效，未提交创建")
         return quote
 
     def create(self, offer: GPUOffer, options: RentalOptions, submitted):

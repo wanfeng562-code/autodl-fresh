@@ -5,7 +5,9 @@ import pytest
 
 from autodl_fresh.browser import ActionRejected, ConsoleError, InventoryUnavailable
 from autodl_fresh.models import Instance
-from autodl_fresh.rental import GPUOffer, PENDING_PHASES, RentalConfirmation, RentalEngine, RentalOptions, StockLost
+from autodl_fresh.rental import (
+    GPUOffer, PENDING_PHASES, QuoteUnavailable, RentalConfirmation, RentalEngine, RentalOptions, StockLost,
+)
 from autodl_fresh.storage import Store
 
 
@@ -98,6 +100,44 @@ def test_candidate_quote_rejected_tries_next_without_submitting(tmp_path):
     assert engine(store, adapter).run()["phase"] == "completed"
     assert ("create", "m1") not in adapter.events
     assert ("create", "m2") in adapter.events
+
+
+def test_missing_quotes_obey_deadline_without_submitting_or_losing_retry_message(tmp_path):
+    store = Store(tmp_path)
+    adapter = FakeClone(store)
+    def unavailable(*args):
+        raise QuoteUnavailable('实时报价暂未就绪')
+    adapter.select = unavailable
+    changes = []
+    result = engine(store, adapter, options(max_minutes=1, interval_seconds=30),
+                    changed=lambda t:changes.append(t['message'])).run()
+    assert result['phase'] == 'expired' and result['attempts'] == 2
+    assert adapter.events == ['prepare','offers','offers']
+    assert any('实时报价暂未就绪' in m and '重新检查库存' in m for m in changes)
+    assert not any('暂无可租机器' in m for m in changes)
+
+
+@pytest.mark.parametrize('submitted', [False, True])
+def test_quote_loss_before_create_can_retry_but_a_submitted_order_remains_uncertain(tmp_path, submitted):
+    store = Store(tmp_path)
+    adapter = FakeClone(store)
+    original, calls = adapter.create, []
+    def create(offer, config, before_submit):
+        calls.append(offer.machine_id)
+        if len(calls) == 1:
+            if submitted:
+                before_submit()
+            raise QuoteUnavailable('报价已变化')
+        return original(offer, config, before_submit)
+    adapter.create = create
+    result = engine(store, adapter).run()
+    if submitted:
+        assert result['phase'] == 'uncertain' and len(calls) == 1
+        with pytest.raises(ConsoleError, match='尚未确认'):
+            engine(store, FakeClone(store)).run()
+    else:
+        assert result['phase'] == 'completed' and result['attempts'] == 2
+        assert len(calls) == 2
 
 
 def test_empty_stock_polls_to_deadline_and_stops_without_order(tmp_path):

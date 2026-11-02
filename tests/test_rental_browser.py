@@ -7,8 +7,8 @@ from urllib.parse import urlsplit
 import pytest
 from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
-from autodl_fresh.browser import ActionRejected, AutoDLConsole, ConsoleError, LayoutChanged
-from autodl_fresh.rental import RentalEngine, RentalOptions
+from autodl_fresh.browser import ActionRejected, AutoDLConsole, Cancelled, ConsoleError, LayoutChanged, SessionExpired
+from autodl_fresh.rental import QuoteUnavailable, RentalEngine, RentalOptions
 from autodl_fresh.rental_browser import CloneConsole
 from autodl_fresh.storage import Settings, Store
 
@@ -35,6 +35,9 @@ class CloneSite:
         self.disposed_responses = 0
         self.price = "2.00"
         self.api_price = None
+        self.quote_failures = 0
+        self.quote_auth_failed = False
+        self.quote_requests = []
         self.disk_price = "0"
         self.expanded = "0"
         self.wrong_region = False
@@ -83,6 +86,14 @@ class CloneSite:
                 self.creations += 1
                 route.fulfill(json={"code": "Success", "data": TARGET})
         elif path == "/api/v1/order/price/preview":
+            self.quote_requests.append(request.post_data_json)
+            if self.quote_auth_failed:
+                route.fulfill(status=401, json={"code":"AuthorizeFailed"})
+                return
+            if self.quote_failures:
+                self.quote_failures -= 1
+                route.fulfill(status=503, json={"code":"Unavailable"})
+                return
             route.fulfill(json={"code": "Success", "data": {
                 "discount_list": [{"product_type": "instance", "origin_price": float(self.api_price or self.price) * 1000,
                                    "total_reduction": 0}],
@@ -421,8 +432,99 @@ def test_passive_observers_tolerate_page_closing_during_response_body(site_adapt
             raise PlaywrightError("Target page, context or browser has been closed")
     observer = {"quote": adapter._observe_quote,
                 "machine": adapter._machine_response}[kind]
-    observer(ClosingResponse())
+    response = ClosingResponse()
+    if kind == 'quote':
+        adapter.price_latest = response.request
+    observer(response)
     assert adapter.price_key is None
+
+
+def test_already_selected_host_keeps_current_round_quote_without_requiring_another_request(site_adapter):
+    site, adapter = site_adapter
+    adapter.prepare(SOURCE)
+    offer = adapter.offers(config(), threading.Event())[0]
+    adapter.page.evaluate("choose('m1'); void 0")
+    adapter.page.wait_for_timeout(150)
+    assert adapter.price_key == ('m1', 1, 0, 'payg')
+    adapter.page.evaluate("""window.firstChoose = choose;
+        window.choose = id => { if (selected !== id) firstChoose(id); }; void 0""")
+    adapter.QUOTE_TIMEOUT_SECONDS = .3
+    assert float(adapter.select(offer, config())['hourly']) == 2
+    assert len(site.quote_requests) == 1 and not site.orders
+
+
+def test_temporary_quote_failure_refreshes_filters_and_rents_once_without_navigation(site_adapter, tmp_path):
+    site, adapter = site_adapter
+    site.quote_failures = 1
+    messages = []
+    clock = [0]
+    def wait(seconds):
+        clock[0] += seconds
+    task = RentalEngine(adapter, Store(tmp_path), config(max_minutes=1, interval_seconds=30),
+                        clock=lambda:clock[0], wait=wait,
+                        changed=lambda t:messages.append(t['message'])).run()
+    assert task['phase'] == 'completed' and task['attempts'] == 2
+    assert len(site.quote_requests) == 2 and len(site.orders) == 1
+    assert site.page_paths == ['/console/instance/list', '/cloneInstance']
+    assert any('实时报价请求暂未成功' in m and '重新检查库存' in m for m in messages)
+
+
+def test_quote_timeout_can_be_cancelled_instead_of_waiting_for_the_full_deadline(site_adapter):
+    site, adapter = site_adapter
+    adapter.prepare(SOURCE)
+    offer = adapter.offers(config(), threading.Event())[0]
+    cancel = threading.Event()
+    adapter.cancel = cancel
+    adapter.page.evaluate("window.choose = id => {selected=id;render();}; void 0")
+    timer = threading.Timer(.15, cancel.set)
+    timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(Cancelled):
+            adapter.select(offer, config())
+        assert time.monotonic() - started < 3 and not site.orders
+    finally:
+        timer.join()
+
+
+def test_missing_quote_request_is_retryable_and_old_round_is_not_reused(site_adapter):
+    site, adapter = site_adapter
+    adapter.prepare(SOURCE)
+    offer = adapter.offers(config(), threading.Event())[0]
+    assert adapter.select(offer, config())
+    adapter.offers(config(), threading.Event())
+    assert adapter.price_key is None
+    adapter.page.evaluate("window.choose = id => {selected=id;render();}; void 0")
+    adapter.QUOTE_TIMEOUT_SECONDS = .25
+    with pytest.raises(QuoteUnavailable, match='暂未收到'):
+        adapter.select(offer, config())
+    assert not site.orders
+
+
+def test_quote_wait_allows_final_fee_dom_to_finish_rendering(site_adapter):
+    site, adapter = site_adapter
+    adapter.prepare(SOURCE)
+    offer = adapter.offers(config(), threading.Event())[0]
+    adapter.page.evaluate("""window.choose=id=>{
+        selected=id;render();document.querySelector('#quote').textContent='-';
+        fetch('/api/v1/order/price/preview',{method:'POST',body:JSON.stringify({
+            machine_id:id,num:1,expand_data_disk:0,charge_type:'payg'
+        })}).then(r=>r.json()).then(()=>setTimeout(()=>document.querySelector('#quote').textContent='2.00',400));
+    }; void 0""")
+    started = time.monotonic()
+    assert adapter.select(offer, config())
+    assert time.monotonic() - started >= .3
+    assert not site.orders
+
+
+def test_quote_auth_expiry_stops_for_manual_login_without_an_order(site_adapter):
+    site, adapter = site_adapter
+    site.quote_auth_failed = True
+    adapter.prepare(SOURCE)
+    offer = adapter.offers(config(), threading.Event())[0]
+    with pytest.raises(SessionExpired, match='报价登录态已过期'):
+        adapter.select(offer, config())
+    assert not site.orders
 
 
 @pytest.mark.parametrize("kind", ["hourly", "disk", "capacity"])

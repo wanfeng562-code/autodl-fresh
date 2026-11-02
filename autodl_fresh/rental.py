@@ -86,6 +86,10 @@ class StockLost(ActionRejected):
         self.code = code
 
 
+class QuoteUnavailable(InventoryUnavailable):
+    """The live quote is temporarily unavailable BEFORE submitting an order."""
+
+
 def money(value) -> Decimal:
     try:
         result = Decimal(str(value))
@@ -165,6 +169,10 @@ class RentalEngine:
     def _archive(self):
         history = self.store.read("rental-history.json", [])
         self.store.write("rental-history.json", [self.task, *history][:100])
+
+    def _retry_selection(self, exc):
+        self._save(offer={}, quote={}, message=f"{exc}；{self.options.interval_seconds} 秒后重新检查库存（可停止）")
+        self.log(self.task["message"])
 
     def _verify(self):
         try:
@@ -246,6 +254,7 @@ class RentalEngine:
                 self._save(attempts=self.task["attempts"] + 1,
                            message=f"第 {self.task['attempts'] + 1} 次检查：{len(candidates)} 台符合型号及卡数")
                 stock_lost = False
+                selection_unavailable = False
                 for offer in candidates:
                     if self.cancel.is_set():
                         raise Cancelled("候租已停止，未提交创建")
@@ -254,7 +263,8 @@ class RentalEngine:
                     try:
                         quote = self.adapter.select(offer, self.options)
                     except InventoryUnavailable as exc:
-                        self._save(message=f"选机页面暂未就绪：{exc}；将重新检查库存")
+                        selection_unavailable = True
+                        self._retry_selection(exc)
                         break
                     if quote is None:
                         continue
@@ -267,6 +277,14 @@ class RentalEngine:
                         self._save(phase="submitted", message="正在提交创建并开机，请勿重复下单")
                     try:
                         target_uuid = self.adapter.create(offer, self.options, submitted)
+                    except QuoteUnavailable as exc:
+                        # Only a quote check before submitted() may retry. Once
+                        # an order might have gone out, preserve uncertainty.
+                        if self.task.get("phase") in PENDING_PHASES:
+                            raise
+                        selection_unavailable = True
+                        self._retry_selection(exc)
+                        break
                     except StockLost as exc:
                         # The platform explicitly rejected this attempt. Drop
                         # the old snapshot and obtain fresh stock on the SAME
@@ -283,7 +301,7 @@ class RentalEngine:
                     # Once a request was accepted, stopping does not abandon its
                     # verification, and must never turn off a GPU rented for use.
                     return self._verify()
-                if not stock_lost:
+                if not stock_lost and not selection_unavailable:
                     self._save(message=f"暂无可租机器，{self.options.interval_seconds} 秒后重试")
                 self.wait(min(self.options.interval_seconds, max(0, deadline - self.clock())))
             self._save(phase="expired", message="已到最长候租时间，未创建实例")
