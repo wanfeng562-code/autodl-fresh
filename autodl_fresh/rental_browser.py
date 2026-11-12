@@ -54,6 +54,7 @@ class CloneConsole:
         self.machine_pending = set()
         self.machine_failed = False
         self.machine_latest = None
+        self.machine_loaded = None
         self.machine_sequence = 0
         self.machine_success = 0
         self.machine_auth_failed = False
@@ -86,6 +87,7 @@ class CloneConsole:
         if urlsplit(request.url).path == self.MACHINE_PATH:
             self.machine_pending.add(request)
             self.machine_latest = request
+            self.machine_loaded = None
             self.machine_sequence += 1
             self.machine_failed = False
             self.sorted_idle_floor = None
@@ -107,6 +109,7 @@ class CloneConsole:
                 self.machine_auth_failed = response.status in {401, 403} or payload.get("code") == "AuthorizeFailed"
                 self.machine_failed = response.status != 200 or payload.get("code") != "Success"
                 if not self.machine_failed:
+                    self.machine_loaded = response.request
                     self.machine_success = self.machine_sequence
                     self._observe_idle_sort(response, payload)
             except (ValueError, TypeError, KeyError, AttributeError, PlaywrightError):
@@ -132,6 +135,7 @@ class CloneConsole:
         # Old, cancelled navigations must never poison the next table load.
         self.machine_pending.clear()
         self.machine_latest = None
+        self.machine_loaded = None
         self.machine_failed = False
         self.machine_auth_failed = False
         self.sorted_idle_floor = None
@@ -322,7 +326,25 @@ class CloneConsole:
         group = self.page.locator(self.FILTER).locator(".filter-item").filter(has_text="GPU型号")
         return group.locator('input[type="checkbox"]')
 
-    def _wait_table(self, *, after=None):
+    def _request_has_models(self, names):
+        try:
+            body = self.machine_latest.post_data_json
+            models = body.get("gpu_type_name")
+            return isinstance(models, list) and bool(models) and set(models) == set(names)
+        except (ValueError, TypeError, AttributeError, PlaywrightError):
+            return False
+
+    def _selected_models(self):
+        return self._gpu_checkboxes().evaluate_all(
+            "es=>es.filter(e=>e.checked && e.value!=='false').map(e=>e.value)")
+
+    def _assert_inventory_filter(self, names):
+        if (not names or set(self._selected_models()) != set(names)
+                or not self._request_has_models(names) or self.machine_loaded is not self.machine_latest
+                or self.machine_latest in self.machine_pending):
+            raise InventoryUnavailable("目标型号筛选尚未就绪，不读取全部 GPU，将重新检查")
+
+    def _wait_table(self, *, after=None, models=None):
         self._check_cancel(self.cancel)
         table = self.page.locator(self.TABLE)
         table.wait_for(state="visible")
@@ -334,9 +356,11 @@ class CloneConsole:
             self.console._check_origin()
             if self.machine_auth_failed:
                 raise SessionExpired("AutoDL 登录态已过期，请重新登录")
-            if self.machine_failed:
+            matches = models is None or self._request_has_models(models)
+            if self.machine_failed and matches:
                 raise InventoryUnavailable("当前网页筛选请求暂未成功，将自动重试")
-            if (not table.locator(".el-loading-mask:visible").count()
+            if (matches and (models is None or self.machine_loaded is self.machine_latest)
+                    and not table.locator(".el-loading-mask:visible").count()
                     and self.machine_latest not in self.machine_pending
                     and (after is None or self.machine_success > after)):
                 self.page.wait_for_timeout(50)
@@ -352,17 +376,19 @@ class CloneConsole:
     def _set_models(self, names):
         self._assert_page()
         checkboxes = self._gpu_checkboxes()
-        for control in checkboxes.all():
-            self._check_cancel(self.cancel)
-            value = control.input_value()
-            if value == "false":
-                continue
-            wanted = value in names
-            if control.is_checked() != wanted:
-                before = self.machine_sequence
-                control.locator("xpath=ancestor::label[1]").click()
-                self._wait_table(after=before)
-        selected = checkboxes.evaluate_all("es=>es.filter(e=>e.checked && e.value!=='false').map(e=>e.value)")
+        # Select the new types first so switching a single type never waits on
+        # an empty selection (which AutoDL interprets as all GPU types).
+        for wanted in (True, False):
+            for control in checkboxes.all():
+                self._check_cancel(self.cancel)
+                value = control.input_value()
+                if value == "false" or (value in names) != wanted:
+                    continue
+                if control.is_checked() != wanted:
+                    before = self.machine_sequence
+                    control.locator("xpath=ancestor::label[1]").click()
+                    self._wait_table(after=before)
+        selected = self._selected_models()
         if set(selected) != set(names):
             raise LayoutChanged("GPU 型号勾选状态不匹配，已停止")
         self._assert_page()
@@ -392,7 +418,7 @@ class CloneConsole:
             raise LayoutChanged("机器表格列已变化，无法可靠识别型号、空闲卡数与报价")
         return result
 
-    def _read_offers(self, *, include_unavailable=False):
+    def _read_offers(self, *, include_unavailable=False, gpu_names=None):
         columns = self._headers()
         result = []
         # One synchronous browser-side snapshot. Positional Locator.all() calls
@@ -410,9 +436,17 @@ class CloneConsole:
             radio = row["radios"][0]
             if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", radio["value"]):
                 raise LayoutChanged("机器行的 ID 格式无法识别")
+            cells = row["cells"]
+            # A late unfiltered response may still be rendered by the website.
+            # Reject that snapshot before scrolling, including disabled hosts.
+            if gpu_names is not None:
+                if len(cells) <= columns["gpu"]:
+                    raise InventoryUnavailable("主机表格正在重新生成，将重新检查")
+                lines = cells[columns["gpu"]].strip().splitlines()
+                if not lines or lines[0].strip() not in gpu_names:
+                    raise InventoryUnavailable("机器表格仍包含其他型号的旧结果，将重新筛选")
             if not include_unavailable and radio["disabled"]:
                 continue
-            cells = row["cells"]
             if len(cells) <= max(columns.values()):
                 raise InventoryUnavailable("主机表格正在重新生成，将重新检查")
             name = cells[columns["gpu"]].strip().splitlines()[0].strip()
@@ -446,14 +480,16 @@ class CloneConsole:
             descending.click()
             self._wait_table(after=before)
         last = options.gpu_names[-1]
-        # Keep every requested type selected, refreshing only the final type.
+        # Restore the final type immediately. In particular, do not wait for or
+        # paginate the all-GPU response produced by unchecking the only type.
         for wanted in (False, True):
             self._check_cancel(cancel)
             control = next(c for c in self._gpu_checkboxes().all() if c.input_value() == last)
             if control.is_checked() != wanted:
                 before = self.machine_sequence
                 control.locator("xpath=ancestor::label[1]").click()
-                self._wait_table(after=before)
+                if wanted:
+                    self._wait_table(after=before, models=options.gpu_names)
         self._check_cancel(cancel)
         return self._collect_offers(options, cancel)
 
@@ -462,7 +498,8 @@ class CloneConsole:
         for _ in range(300):
             self._check_cancel(cancel)
             self._assert_page()
-            for item in self._read_offers():
+            self._assert_inventory_filter(options.gpu_names)
+            for item in self._read_offers(gpu_names=options.gpu_names):
                 found[item.machine_id] = item
             if any(item.gpu_name == options.gpu_names[0] and item.idle >= options.gpu_count
                    for item in found.values()):
@@ -471,29 +508,32 @@ class CloneConsole:
                 return list(found.values())
             rows = self.page.locator(self.TABLE).locator(self.ROWS)
             signature = tuple(rows.locator('input[type="radio"]').evaluate_all("es=>es.map(e=>e.value)"))
+            self._assert_inventory_filter(options.gpu_names)
             self.page.locator(self.TABLE).locator(".el-table__body-wrapper").evaluate(
                 "e=>{e.scrollTop=e.scrollHeight;e.dispatchEvent(new Event('scroll'))}")
             self.page.wait_for_timeout(100)
-            self._wait_table()
+            self._wait_table(models=options.gpu_names)
             current = tuple(rows.locator('input[type="radio"]').evaluate_all("es=>es.map(e=>e.value)"))
             if current == signature and previous == signature:
                 return list(found.values())
             previous = signature
         raise LayoutChanged("机器滚动列表超过读取上限，已停止候租")
 
-    def _find_available(self, offer):
+    def _find_available(self, offer, options):
         previous = None
         for _ in range(300):
             self._assert_page()
-            for current in self._read_offers():
+            self._assert_inventory_filter(options.gpu_names)
+            for current in self._read_offers(gpu_names=options.gpu_names):
                 if current.machine_id == offer.machine_id:
                     return current
             rows = self.page.locator(self.TABLE).locator(self.ROWS)
             signature = tuple(rows.locator('input[type="radio"]').evaluate_all("es=>es.map(e=>e.value)"))
             scroll = self.page.locator(self.TABLE).locator(".el-table__body-wrapper")
+            self._assert_inventory_filter(options.gpu_names)
             scroll.evaluate("e=>{e.scrollTop=e.scrollHeight; e.dispatchEvent(new Event('scroll'))}")
             self.page.wait_for_timeout(350)
-            self._wait_table()
+            self._wait_table(models=options.gpu_names)
             current = tuple(rows.locator('input[type="radio"]').evaluate_all("es=>es.map(e=>e.value)"))
             if current == signature and previous == signature:
                 return None
@@ -544,7 +584,7 @@ class CloneConsole:
         # Clicking an already-selected host may not issue another preview.
         # Keep a matching response obtained in this same inventory round.
         self._assert_page()
-        current = self._find_available(offer)
+        current = self._find_available(offer, options)
         if not current or current.gpu_name != offer.gpu_name or current.idle < options.gpu_count:
             return None
         row = self._machine_row(offer.machine_id)
@@ -615,7 +655,10 @@ class CloneConsole:
                     raise ConsoleError("创建响应未确认成功且含有结果数据，请先在网页核对，暂停新的租用")
                 code = payload["code"]
                 if self._stock_rejection(code, payload.get("msg", "")):
-                    raise StockLost("该主机空闲 GPU 已不足或被其他用户租走，平台未接受此次创建", code=code)
+                    reason = ("平台拒绝了本次创建（InternalError），将重新检查 GPU 库存"
+                              if code == "InternalError"
+                              else "该主机空闲 GPU 已不足或被其他用户租走，平台未接受此次创建")
+                    raise StockLost(reason, code=code)
                 safe_code = code if re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", code) else "Unknown"
                 raise ActionRejected(f"平台拒绝创建（错误码：{safe_code}），请检查余额、权限、实名认证或克隆次数")
             uuid = payload.get("data")
@@ -639,9 +682,9 @@ class CloneConsole:
             return False
         if any(word in message for word in ("余额", "钱包", "实名", "权限", "克隆次数", "配额", "BALANCE", "QUOTA")):
             return False
-        # MachineGpuNumUpdateFailed is the stock code handled by AutoDL's own
-        # frontend. A narrow message fallback covers generic error envelopes.
-        return code in {"MachineGpuNumUpdateFailed", "NoStock"} or any(text in message for text in (
+        # The caller has already required HTTP 200 and empty result data.
+        # Recheck inventory after a business-level InternalError as well.
+        return code in {"MachineGpuNumUpdateFailed", "NoStock", "InternalError"} or any(text in message for text in (
             "空闲GPU数量不足", "GPU数量不足", "GPU资源不足", "没有空闲GPU", "无可用GPU",
             "GPU已被占用", "GPU已被租用", "主机已被占用", "主机资源不足", "该主机资源已售罄"))
 

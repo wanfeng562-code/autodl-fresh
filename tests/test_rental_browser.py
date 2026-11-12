@@ -7,7 +7,9 @@ from urllib.parse import urlsplit
 import pytest
 from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
-from autodl_fresh.browser import ActionRejected, AutoDLConsole, Cancelled, ConsoleError, LayoutChanged, SessionExpired
+from autodl_fresh.browser import (
+    ActionRejected, AutoDLConsole, Cancelled, ConsoleError, InventoryUnavailable, LayoutChanged, SessionExpired,
+)
 from autodl_fresh.rental import QuoteUnavailable, RentalEngine, RentalOptions
 from autodl_fresh.rental_browser import CloneConsole
 from autodl_fresh.storage import Settings, Store
@@ -48,6 +50,9 @@ class CloneSite:
         self.sortable = False
         self.market_queries = []
         self.market_failures = 0
+        self.fail_unfiltered = False
+        self.hold_unfiltered = False
+        self.held_unfiltered = []
         self.market_auth_failed = False
         self.page_views = 0
         self.page_paths = []
@@ -107,6 +112,13 @@ class CloneSite:
             else:
                 body = request.post_data_json
                 self.market_queries.append(body)
+            if not body.get("gpu_type_name"):
+                if self.hold_unfiltered:
+                    self.held_unfiltered.append(route)
+                    return
+                if self.fail_unfiltered:
+                    route.fulfill(status=503, json={"code": "Unavailable"})
+                    return
             if self.market_auth_failed:
                 route.fulfill(json={"code": "AuthorizeFailed"})
                 return
@@ -609,15 +621,24 @@ def test_dom_explicit_platform_rejection_is_not_success(site_adapter, tmp_path):
     {'code':'MachineGpuNumUpdateFailed','msg':'该主机空闲GPU数量不足，请更换主机。'},
     {'code':'NoStock'},
     {'code':'Failed','msg':'该主机空闲 GPU 数量不足，请更换主机。'},
+    {'code':'InternalError', 'msg':'Internal error', 'data':None},
 ])
 def test_lost_stock_retries_on_same_clone_document_and_only_creates_one_target(site_adapter, tmp_path, payload):
     site, adapter = site_adapter
     site.order_replies = [(200, payload)]
     changes = []
+    waits = []
+    def wait(seconds):
+        assert len(site.orders) == 1
+        site.machines[0]['idle'] = 0
+        site.machines.append(dict(id='m3', gpu='RTX 4090', idle=2, price='2.00'))
+        waits.append(seconds)
     task = RentalEngine(adapter, Store(tmp_path), config(),
-                        changed=lambda t:changes.append(dict(t)), wait=lambda _:None).run()
+                        changed=lambda t:changes.append(dict(t)), wait=wait).run()
     assert task['phase'] == 'completed' and task['stock_rejections'] == 1
     assert len(site.orders) == 2 and site.creations == 1
+    assert waits == [1]
+    assert [order['instance_info']['machine_id'] for order in site.orders] == ['m1', 'm3']
     assert task['target_uuid'] == TARGET
     assert site.page_paths.count('/cloneInstance') == 1
     assert site.order_page_views[0] == site.order_page_views[1]
@@ -655,6 +676,7 @@ def test_response_loss_on_retry_preserves_uncertainty_and_does_not_try_a_third_o
     ('TORecharge','余额不足'), ('TORealName','请完成实名认证'),
     ('PermissionDenied','没有权限'), ('CloneCountLimit','今日克隆次数不足'),
     ('UnknownFailure','未知错误'), ('TORecharge','空闲GPU数量不足，余额不足'),
+    ('InternalError','余额不足'), ('InternalError','今日克隆次数不足'),
 ])
 def test_permanent_rejections_are_not_misclassified_as_stock_loss(site_adapter, tmp_path, code, message):
     site, adapter = site_adapter
@@ -668,6 +690,8 @@ def test_permanent_rejections_are_not_misclassified_as_stock_loss(site_adapter, 
     (503, {'code':'MachineGpuNumUpdateFailed'}),
     (200, {'code':'MachineGpuNumUpdateFailed','data':TARGET}),
     (200, {'code':'NoStock','data':{'uuid':TARGET}}),
+    (500, {'code':'InternalError'}),
+    (200, {'code':'InternalError','data':TARGET}),
     (200, {'msg':'空闲GPU数量不足'}),
 ])
 def test_unconfirmed_responses_never_retry_even_with_stock_words(site_adapter, tmp_path, status, payload):
@@ -777,6 +801,93 @@ def test_each_poll_toggles_only_last_selected_model_and_never_navigates_before_o
     assert site.page_views == views  # Select on the very same clone document.
     assert adapter.create(chosen, options, lambda: None) == TARGET
     assert len(site.orders) == 1
+
+
+@pytest.mark.parametrize('intermediate', ['failed', 'pending'])
+def test_single_model_poll_does_not_wait_for_the_unfiltered_intermediate_result(site_adapter, intermediate):
+    site, adapter = site_adapter
+    site.sortable = True
+    site.machines = [dict(id=f'other-{i}', gpu='RTX 3090', idle=2, price='1') for i in range(95)]
+    site.machines.append(dict(id='wanted-busy', gpu='RTX 4090', idle=0, price='2'))
+    adapter.prepare(SOURCE)
+    site.fail_unfiltered = intermediate == 'failed'
+    site.hold_unfiltered = intermediate == 'pending'
+    reads = []
+    original = adapter._read_offers
+    def read(**kwargs):
+        reads.append(adapter.page.evaluate('allowedModels()'))
+        return original(**kwargs)
+    adapter._read_offers = read
+    for _ in range(2):
+        assert adapter.offers(config(), threading.Event()) == []
+    assert reads and all(models == ['RTX 4090'] for models in reads)
+    assert max(q['page_index'] for q in site.market_queries) == 1
+    assert site.page_paths == ['/console/instance/list', '/cloneInstance']
+    if intermediate == 'pending':
+        assert len(site.held_unfiltered) == 2
+    assert not site.orders
+
+
+@pytest.mark.parametrize('state', ['unchecked', 'unfiltered_request', 'late_unfiltered_dom', 'late_busy_dom'])
+def test_unfiltered_results_never_start_machine_pagination(site_adapter, state):
+    site, adapter = site_adapter
+    site.machines = [dict(id=f'other-{i}', gpu='RTX 3090', idle=2, price='1') for i in range(95)]
+    site.machines.append(dict(id='wanted', gpu='RTX 4090', idle=1, price='2'))
+    adapter.prepare(SOURCE)
+    options = config()
+    assert adapter.offers(options, threading.Event())
+    if state == 'unchecked':
+        adapter._gpu_checkboxes().first.uncheck()
+        adapter.page.wait_for_timeout(300)
+    elif state == 'unfiltered_request':
+        adapter.page.evaluate("""async path=>{
+            const response=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({gpu_type_name:[],page_index:1,page_size:10})});
+            const payload=await response.json();machines=normalize(payload.data.list);render();
+        }""", adapter.MACHINE_PATH)
+    else:
+        # An older response can render after the final checkbox request, even
+        # though the latest observed request still has the correct filter.
+        adapter.page.evaluate("""idle=>{machines=[{id:'other-late',gpu:'RTX 3090',idle,price:'1',fromServer:true}];
+            total=95;pageIndex=1;render();}""", 0 if state == 'late_busy_dom' else 2)
+    before = len(site.market_queries)
+    with pytest.raises(InventoryUnavailable, match='型号|筛选'):
+        adapter._collect_offers(options, threading.Event())
+    assert not any(q['page_index'] > 1 for q in site.market_queries[before:])
+    assert not site.orders
+
+
+def test_single_model_poll_waits_for_the_rechecked_filter_before_reading(site_adapter):
+    site, adapter = site_adapter
+    adapter.prepare(SOURCE)
+    # The page may debounce its final filter request after the intermediate
+    # all-GPU request. Neither the old quote nor its table is a final result.
+    adapter.page.evaluate("""()=>{
+        const original=filtersChanged;
+        window.filtersChanged=control=>{
+            if(allowedModels().length) setTimeout(()=>original(control),500);
+            else original(control);
+        };
+    }""")
+    options = config()
+    views = site.page_views
+    offers = adapter.offers(options, threading.Event())
+    assert [offer.machine_id for offer in offers] == ['m1']
+    assert site.market_queries[-1]['gpu_type_name'] == options.gpu_names
+    assert site.page_views == views and not site.orders
+
+
+def test_switching_a_single_model_selects_the_replacement_before_removing_the_old_type(site_adapter):
+    site, adapter = site_adapter
+    adapter.prepare(SOURCE)
+    adapter._set_models(['RTX 4090'])
+    adapter.page.evaluate('window.toggles=[]')
+    adapter._set_models(['RTX 3090'])
+    toggles = adapter.page.evaluate('window.toggles')
+    assert all(toggle['all'] for toggle in toggles)
+    assert adapter._selected_models() == ['RTX 3090']
+    assert adapter._read_offers()[0].gpu_name == 'RTX 3090'
+    assert not site.orders
 
 
 def test_failed_initial_table_can_retry_inside_existing_clone_page(site_adapter):
