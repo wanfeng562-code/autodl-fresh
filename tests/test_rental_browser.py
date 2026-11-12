@@ -42,6 +42,8 @@ class CloneSite:
         self.quote_requests = []
         self.disk_price = "0"
         self.expanded = "0"
+        self.clone_source_text = f"{SOURCE} / 示例"
+        self.hide_clone_form = False
         self.wrong_region = False
         self.source_region = "西北B区"
         self.route_region = "west-B"
@@ -167,7 +169,10 @@ class CloneSite:
                          for gpu in ("RTX 4090", "RTX 3090"))
         sort_button = '<i class="sort-caret descending" style="display:inline-block;width:20px;height:20px" onclick="sortChanged()">↓</i>' if self.sortable else ''
         return f'''<meta charset="utf-8"><style>td{{padding:12px}} .el-table__body-wrapper{{height:160px;overflow:auto}}</style>
-        <div class="create-wrap"><div>{SOURCE} / 示例</div><label><input type="radio" value="payg" checked>按量计费</label>
+        <div class="create-wrap" {'hidden' if self.hide_clone_form else ''}>
+        <div class="instance-info"><div class="card"><div class="instanceID label">源实例:</div>
+        <div class="value"><div class="noMachine"><span>{self.clone_source_text}</span></div></div></div></div>
+        <label><input type="radio" value="payg" checked>按量计费</label>
         <div class="select-server"><div class="list-filter">
         <div class="filter-item">选择地区:<label><input type="radio" value="westDC3" {'' if self.special_zone else 'checked'}>{region}</label></div>{second}
         <div class="filter-item" id="gpu-types">GPU型号:<div class="st-checkbox">{radios}</div></div>
@@ -386,6 +391,64 @@ def test_dom_source_region_mismatch_fails_before_any_order(site_adapter):
     with pytest.raises(LayoutChanged, match="地区"):
         adapter.prepare(SOURCE)
     assert site.orders == []
+
+
+def test_clone_preparation_recovers_when_route_loads_before_source_card(site_adapter, tmp_path):
+    site, adapter = site_adapter
+    site.hide_clone_form = True
+    site.clone_source_text = ""
+    adapter.page.set_default_timeout(1000)
+    waits = []
+    messages = []
+
+    def wait(seconds):
+        assert not site.orders
+        assert site.page_paths == ['/console/instance/list', '/cloneInstance']
+        waits.append(seconds)
+        if len(waits) == 1:
+            adapter.page.locator(adapter.ROOT).evaluate("e=>e.hidden=false")
+        elif len(waits) == 2:
+            adapter.page.locator('.instance-info .value span').evaluate("(e, id)=>e.textContent=id", SOURCE)
+        else:
+            pytest.fail('Clone form is ready and should not require another preparation retry')
+
+    task = RentalEngine(adapter, Store(tmp_path), config(), wait=wait,
+                        changed=lambda task: messages.append(task['message'])).run()
+    assert task['phase'] == 'completed' and len(site.orders) == 1
+    assert waits == [1, 1]
+    assert any('读取超时' in message and message.count('自动重试') == 1 for message in messages)
+    assert any('源实例信息尚未显示' in message for message in messages)
+
+
+def test_clone_page_can_show_the_source_id_without_a_name(site_adapter):
+    site, adapter = site_adapter
+    site.clone_source_text = SOURCE
+    assert adapter.prepare(SOURCE).uuid == SOURCE
+    assert not site.orders
+
+
+@pytest.mark.parametrize('displayed', [f'{TARGET} / 其他实例', f'{SOURCE}extra'])
+def test_wrong_source_id_in_clone_card_stops_before_order(site_adapter, displayed):
+    site, adapter = site_adapter
+    site.clone_source_text = displayed
+    with pytest.raises(LayoutChanged, match='页面源实例不匹配'):
+        adapter.prepare(SOURCE)
+    assert not site.orders
+
+
+@pytest.mark.parametrize('parameter,value', [('id', TARGET), ('region', 'changed-region'), ('copy_data_disk', '0')])
+def test_clone_preparation_retry_rejects_changed_route_parameters(site_adapter, parameter, value):
+    site, adapter = site_adapter
+    adapter.prepare(SOURCE)
+    views = site.page_views
+    adapter.page.evaluate("""([key, value])=>{
+        const url = new URL(location.href);
+        url.searchParams.set(key, value);
+        history.replaceState(null, '', url);
+    }""", [parameter, value])
+    with pytest.raises(LayoutChanged, match='克隆页的源实例、数据盘或地区不匹配'):
+        adapter.prepare(SOURCE)
+    assert site.page_views == views and not site.orders
 
 
 def test_region_route_alias_and_inventory_changes_are_not_region_switches(site_adapter):

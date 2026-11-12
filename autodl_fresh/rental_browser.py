@@ -29,7 +29,6 @@ class CloneConsole:
     def __init__(self, console, *, auth_state=None, request_client=None):
         self.console, self.page = console, console.page
         self.source = None
-        self.url = ""
         self.region_sign = ""
         self.region_value = ""
         self.expand_bytes = 0
@@ -204,18 +203,18 @@ class CloneConsole:
     def prepare(self, uuid):
         try:
             current = urlsplit(self.page.url)
-            query = parse_qs(current.query)
-            if self.source and self.source.uuid == uuid and current.path == "/cloneInstance" and query.get("id") == [uuid]:
+            if self.source and self.source.uuid == uuid and current.path == "/cloneInstance":
                 # A retry after entering the clone page stays on that page.
-                self._remember_clone_page()
-                self._assert_page()
+                if not self.region_sign:
+                    self._remember_clone_page()
+                self._assert_page(preparing=True)
                 # An earlier failed table request cannot recover by waiting on
                 # itself. offers() starts a fresh request with the checkboxes.
                 return self.source
             return self._prepare(uuid)
         except PlaywrightTimeoutError as exc:
             self.console._check_origin()
-            raise InventoryUnavailable("克隆页面读取超时，将自动重试") from exc
+            raise InventoryUnavailable("克隆页面读取超时") from exc
 
     def _prepare(self, uuid):
         self._new_table_round()
@@ -223,6 +222,7 @@ class CloneConsole:
         if source.status != "已关机" or source.blocked_reason:
             raise ConsoleError("候租的源实例必须已关机且状态正常，请先手动确认。")
         self.source = source
+        self.region_sign = self.region_value = ""
         self.console._row(uuid).get_by_role("button", name="更多", exact=True).click()
         self.page.locator(".el-dropdown-menu:visible").get_by_text("克隆实例", exact=True).click()
         dialog = self.page.locator(".el-dialog:visible").filter(has_text="克隆实例")
@@ -243,40 +243,53 @@ class CloneConsole:
         self.page.locator(self.ROOT).wait_for(state="visible")
         self._remember_clone_page()
         self._wait_table()
-        self._assert_page()
+        self._assert_page(preparing=True)
         return source
 
     def _remember_clone_page(self):
-        query = parse_qs(urlsplit(self.page.url).query)
-        self.url = self.page.url
-        self.region_sign = query.get("region", [""])[0]
-        self.region_value = ""
+        query = self._clone_query()
         try:
             self.expand_bytes = int(query.get("expand_size", ["0"])[0] or 0)
             if self.expand_bytes < 0:
                 raise ValueError
         except ValueError as exc:
             raise LayoutChanged("源数据盘扩容容量无法识别") from exc
+        self.region_sign = query["region"][0]
 
-    def _assert_page(self):
+    def _clone_query(self):
         self.console._check_origin()
         url = urlsplit(self.page.url)
-        query = parse_qs(url.query)
+        query = parse_qs(url.query, keep_blank_values=True)
+        region = query.get("region", [])
         if (url.path != "/cloneInstance" or query.get("id") != [self.source.uuid]
-                or query.get("copy_data_disk") != ["1"] or query.get("region") != [self.region_sign]
-                or not self.region_sign):
+                or query.get("copy_data_disk") != ["1"] or len(region) != 1 or not region[0]
+                or (self.region_sign and region[0] != self.region_sign)):
             raise LayoutChanged("克隆页的源实例、数据盘或地区不匹配，已停止。")
-        if self.page.locator(self.ROOT).get_by_text(
-                re.compile(r"^" + re.escape(self.source.uuid) + r"\s*/")).count() != 1:
+        return query
+
+    def _assert_page(self, *, preparing=False):
+        self._clone_query()
+        root = self.page.locator(self.ROOT)
+        source_values = root.locator(".instanceID").locator("xpath=..").locator(".value:visible").all_inner_texts()
+        if preparing and (not source_values or (len(source_values) == 1 and not source_values[0].strip())):
+            raise InventoryUnavailable("克隆页的源实例信息尚未显示")
+        # AutoDL displays "ID / name" only when a name is present.
+        if len(source_values) != 1 or source_values[0].partition("/")[0].strip() != self.source.uuid:
             raise LayoutChanged("页面源实例不匹配，已停止。")
-        payg = self.page.locator(self.ROOT).locator('input[type="radio"][value="payg"]')
-        if payg.count() != 1 or not payg.is_checked():
+        payg = root.locator('input[type="radio"][value="payg"]')
+        payg_count = payg.count()
+        if preparing and payg_count == 0:
+            raise InventoryUnavailable("克隆页的计费方式尚未显示")
+        if payg_count != 1 or not payg.is_checked():
             raise LayoutChanged("候租仅支持按量计费，当前计费方式不匹配。")
         regions = self.page.locator(self.FILTER).locator('.filter-item').filter(has_text="选择地区")
         # Special zones are rendered on a second row without the region label.
         regions = regions.or_(self.page.locator(self.FILTER).locator(".second-region"))
         selected = regions.locator('input[type="radio"]:checked')
-        if selected.count() != 1:
+        selected_count = selected.count()
+        if preparing and selected_count == 0:
+            raise InventoryUnavailable("克隆页的地区选项尚未就绪")
+        if selected_count != 1:
             raise LayoutChanged("未能识别克隆页唯一选中地区，请等待页面加载后重试。")
         text = selected.locator("xpath=ancestor::label[1]").inner_text()
         if compact(text) != compact(self.source.region.split("/")[0]):
